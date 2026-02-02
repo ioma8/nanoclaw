@@ -13,7 +13,7 @@
 
 ### 1. Container Isolation (Primary Boundary)
 
-Agents execute in Apple Container (lightweight Linux VMs), providing:
+Agents execute in Docker containers, providing:
 - **Process isolation** - Container processes cannot affect the host
 - **Filesystem isolation** - Only explicitly mounted directories are visible
 - **Non-root execution** - Runs as unprivileged `node` user (uid 1000)
@@ -42,9 +42,9 @@ private_key, .secret
 
 ### 3. Session Isolation
 
-Each group has isolated Claude sessions at `data/sessions/{group}/.claude/`:
+Each group has isolated OpenAI session storage at `data/sessions/{group}/openai/`:
 - Groups cannot see other groups' conversation history
-- Session data includes full message history and file contents read
+- Session data includes message history stored by the agent runner
 - Prevents cross-group information disclosure
 
 ### 4. IPC Authorization
@@ -63,7 +63,7 @@ Messages and task operations are verified against group identity:
 ### 5. Credential Handling
 
 **Mounted Credentials:**
-- Claude auth tokens (filtered from `.env`, read-only)
+- OpenAI API key (filtered from `.env`, read-only)
 
 **NOT Mounted:**
 - WhatsApp session (`store/auth/`) - host only
@@ -71,12 +71,10 @@ Messages and task operations are verified against group identity:
 - Any credentials matching blocked patterns
 
 **Credential Filtering:**
-Only these environment variables are exposed to containers:
+Only this environment variable is exposed to containers:
 ```typescript
-const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+const allowedVars = ['OPENAI_API_KEY'];
 ```
-
-> **Note:** Anthropic credentials are mounted so that Claude Code can authenticate when the agent runs. However, this means the agent itself can discover these credentials via Bash or file operations. Ideally, Claude Code would authenticate without exposing credentials to the agent's execution environment, but I couldn't figure this out. **PRs welcome** if you have ideas for credential isolation.
 
 ## Privilege Comparison
 
@@ -87,7 +85,7 @@ const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
 | Global memory | Implicit via project | `/workspace/global` (ro) |
 | Additional mounts | Configurable | Read-only unless allowed |
 | Network access | Unrestricted | Unrestricted |
-| MCP tools | All | All |
+| IPC tools | All | All |
 
 ## Security Architecture Diagram
 

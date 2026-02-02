@@ -489,7 +489,7 @@ async function connectWhatsApp(): Promise<void> {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      const msg = 'WhatsApp authentication required. Run /setup in Claude Code.';
+      const msg = 'WhatsApp authentication required. Run /setup in your coding assistant.';
       logger.error(msg);
       exec(`osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`);
       setTimeout(() => process.exit(1), 1000);
@@ -576,25 +576,19 @@ async function startMessageLoop(): Promise<void> {
 
 function ensureContainerSystemRunning(): void {
   try {
-    execSync('container system status', { stdio: 'pipe' });
-    logger.debug('Apple Container system already running');
-  } catch {
-    logger.info('Starting Apple Container system...');
-    try {
-      execSync('container system start', { stdio: 'pipe', timeout: 30000 });
-      logger.info('Apple Container system started');
-    } catch (err) {
-      logger.error({ err }, 'Failed to start Apple Container system');
-      console.error('\n╔════════════════════════════════════════════════════════════════╗');
-      console.error('║  FATAL: Apple Container system failed to start                 ║');
-      console.error('║                                                                ║');
-      console.error('║  Agents cannot run without Apple Container. To fix:           ║');
-      console.error('║  1. Install from: https://github.com/apple/container/releases ║');
-      console.error('║  2. Run: container system start                               ║');
-      console.error('║  3. Restart NanoClaw                                          ║');
-      console.error('╚════════════════════════════════════════════════════════════════╝\n');
-      throw new Error('Apple Container system is required but failed to start');
-    }
+    execSync('docker info', { stdio: 'pipe' });
+    logger.debug('Docker daemon is running');
+  } catch (err) {
+    logger.error({ err }, 'Docker daemon is not available');
+    console.error('\n╔════════════════════════════════════════════════════════╗');
+    console.error('║  FATAL: Docker daemon is not running                   ║');
+    console.error('║                                                        ║');
+    console.error('║  Agents cannot run without Docker. To fix:             ║');
+    console.error('║  1. Install Docker Desktop                             ║');
+    console.error('║  2. Start Docker Desktop                               ║');
+    console.error('║  3. Restart NanoClaw                                   ║');
+    console.error('╚════════════════════════════════════════════════════════╝\n');
+    throw new Error('Docker is required but not running');
   }
 }
 

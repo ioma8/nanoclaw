@@ -1,7 +1,7 @@
 {
   "name": "nanoclaw",
   "version": "1.0.0",
-  "description": "Personal Claude assistant. Lightweight, secure, customizable.",
+  "description": "Personal OpenAI assistant. Lightweight, secure, customizable.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -15,6 +15,7 @@
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "better-sqlite3": "^11.8.1",
     "cron-parser": "^5.5.0",
+    "link-preview-js": "^3.2.0",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
     "qrcode-terminal": "^0.12.0",
