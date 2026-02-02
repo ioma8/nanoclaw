@@ -20,7 +20,7 @@ The entire codebase should be something you can read and understand. One Node.js
 
 ### Security Through True Isolation
 
-Instead of application-level permission systems trying to prevent agents from accessing things, agents run in actual Linux containers (Docker). The isolation is at the OS level. Agents can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your Mac.
+Instead of application-level permission systems trying to prevent agents from accessing things, agents run in macOS sandboxes via the Sandbox Runtime. The isolation is at the OS level. Write access is explicitly allowlisted. Bash access is safe because commands run inside the sandbox, not on your Mac.
 
 ### Built for One User
 
@@ -54,12 +54,12 @@ Skills to add or switch to different messaging platforms:
 - `/add-sms` - Add SMS via Twilio or similar
 - `/convert-to-telegram` - Replace WhatsApp with Telegram entirely
 
-### Container Runtime
-The project uses Docker for container isolation.
+### Sandbox Runtime
+The project uses `@anthropic-ai/sandbox-runtime` for sandboxing (macOS only).
 
 ### Platform Support
-- `/setup-linux` - Make the full setup work on Linux (depends on Docker conversion)
-- `/setup-windows` - Windows support via WSL2 + Docker
+- `/setup-linux` - Not supported in this macOS-only setup
+- `/setup-windows` - Not supported in this macOS-only setup
 
 ---
 
@@ -69,7 +69,7 @@ A personal OpenAI agent accessible via WhatsApp, with minimal custom code.
 
 **Core components:**
 - **OpenAI Agents SDK** as the core agent
-- **Docker** for isolated agent execution
+- **Sandbox Runtime** for isolated agent execution
 - **WhatsApp** as the primary I/O channel
 - **Persistent memory** per conversation and globally
 - **Scheduled tasks** that run the agent and can message back
@@ -100,17 +100,16 @@ A personal OpenAI agent accessible via WhatsApp, with minimal custom code.
 - Each group maintains a conversation session via the OpenAI Agents SDK
 - Sessions are stored per group at `data/sessions/{group}/openai/`
 
-### Container Isolation
-- All agents run inside Docker containers
-- Each agent invocation spawns a container with mounted directories
-- Containers provide filesystem isolation - agents can only see mounted paths
-- Bash access is safe because commands run inside the container, not on the host
-- Browser automation via agent-browser with Chromium in the container
+### Sandbox Isolation
+- All agents run inside Sandbox Runtime sandboxes
+- Each agent invocation spawns a sandboxed process with allowlisted write paths
+- Sandboxes provide filesystem isolation for writes; reads are unrestricted unless explicitly denied
+- Bash access is safe because commands run inside the sandbox, not on the host
 
 ### Scheduled Tasks
 - Users can ask the agent to schedule recurring or one-time tasks from any group
 - Tasks run as full agents in the context of the group that created them
-- Tasks have access to all tools including Bash (safe in container)
+- Tasks have access to all tools including Bash (safe in sandbox)
 - Tasks can optionally send messages to their group via `send_message` tool, or complete silently
 - Task runs are logged to the database with duration and result
 - Schedule types: cron expressions, intervals (ms), or one-time (ISO timestamp)
@@ -140,12 +139,12 @@ A personal OpenAI agent accessible via WhatsApp, with minimal custom code.
 - QR code authentication during setup
 
 ### Scheduler
-- Built-in scheduler runs on the host, spawns containers for task execution
+- Built-in scheduler runs on the host, spawns sandboxed runs for task execution
 - Container tools provide scheduling actions over IPC
 - Tools: `schedule_task`, `list_tasks`, `pause_task`, `resume_task`, `cancel_task`, `send_message`
 - Tasks stored in SQLite with run history
 - Scheduler loop checks for due tasks every minute
--- Tasks execute the OpenAI Agents SDK in containerized group context
+-- Tasks execute the OpenAI Agents SDK in sandboxed group context
 
 ### Web Access
 - Built-in `web_search` tool via the OpenAI Responses API

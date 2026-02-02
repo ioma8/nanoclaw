@@ -576,19 +576,42 @@ async function startMessageLoop(): Promise<void> {
 
 function ensureContainerSystemRunning(): void {
   try {
-    execSync('docker info', { stdio: 'pipe' });
-    logger.debug('Docker daemon is running');
+    execSync('command -v sandbox-exec', { stdio: 'pipe' });
   } catch (err) {
-    logger.error({ err }, 'Docker daemon is not available');
+    logger.error({ err }, 'sandbox-exec is not available');
     console.error('\n╔════════════════════════════════════════════════════════╗');
-    console.error('║  FATAL: Docker daemon is not running                   ║');
+    console.error('║  FATAL: sandbox-exec is not available on this system   ║');
     console.error('║                                                        ║');
-    console.error('║  Agents cannot run without Docker. To fix:             ║');
-    console.error('║  1. Install Docker Desktop                             ║');
-    console.error('║  2. Start Docker Desktop                               ║');
-    console.error('║  3. Restart NanoClaw                                   ║');
+    console.error('║  NanoClaw uses Sandbox Runtime on macOS (sandbox-exec) ║');
     console.error('╚════════════════════════════════════════════════════════╝\n');
-    throw new Error('Docker is required but not running');
+    throw new Error('sandbox-exec is required but not available');
+  }
+
+  try {
+    execSync(`sandbox-exec -p '(version 1)(allow default)' /usr/bin/true`, { stdio: 'pipe' });
+  } catch (err) {
+    logger.error({ err }, 'sandbox-exec failed to apply sandbox');
+    console.error('\n╔════════════════════════════════════════════════════════════════╗');
+    console.error('║  FATAL: sandbox-exec failed to apply a sandbox                 ║');
+    console.error('║                                                                ║');
+    console.error('║  Try running this in Terminal to verify:                       ║');
+    console.error('║    sandbox-exec -p "(version 1)(allow default)" /usr/bin/true  ║');
+    console.error('║                                                                ║');
+    console.error('║  If it fails, sandbox-exec is blocked on this system.          ║');
+    console.error('║  Options:                                                      ║');
+    console.error('║    - Set NANOCLAW_DISABLE_SANDBOX=1 to run without sandbox     ║');
+    console.error('║    - Or switch back to Docker                                 ║');
+    console.error('╚════════════════════════════════════════════════════════════════╝\n');
+    throw new Error('sandbox-exec failed to apply sandbox');
+  }
+
+  const requiredTools = ['curl', 'git', 'python3', 'node', 'sed', 'grep'];
+  for (const tool of requiredTools) {
+    try {
+      execSync(`command -v ${tool}`, { stdio: 'pipe' });
+    } catch {
+      logger.warn({ tool }, 'Required tool not found on PATH');
+    }
   }
 }
 

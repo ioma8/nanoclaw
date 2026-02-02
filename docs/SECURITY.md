@@ -6,26 +6,25 @@
 |--------|-------------|-----------|
 | Main group | Trusted | Private self-chat, admin control |
 | Non-main groups | Untrusted | Other users may be malicious |
-| Container agents | Sandboxed | Isolated execution environment |
+| Sandbox agents | Sandboxed | Isolated execution environment |
 | WhatsApp messages | User input | Potential prompt injection |
 
 ## Security Boundaries
 
-### 1. Container Isolation (Primary Boundary)
+### 1. Sandbox Isolation (Primary Boundary)
 
-Agents execute in Docker containers, providing:
+Agents execute in macOS sandboxes (Sandbox Runtime + `sandbox-exec`), providing:
 - **Process isolation** - Container processes cannot affect the host
-- **Filesystem isolation** - Only explicitly mounted directories are visible
-- **Non-root execution** - Runs as unprivileged `node` user (uid 1000)
-- **Ephemeral containers** - Fresh environment per invocation (`--rm`)
+- **Filesystem isolation** - Write access is explicitly allowlisted
+- **Ephemeral sandboxes** - Fresh environment per invocation
 
-This is the primary security boundary. Rather than relying on application-level permission checks, the attack surface is limited by what's mounted.
+This is the primary security boundary. Rather than relying on application-level permission checks, the attack surface is limited by what can be written.
 
 ### 2. Mount Security
 
 **External Allowlist** - Mount permissions stored at `~/.config/nanoclaw/mount-allowlist.json`, which is:
 - Outside project root
-- Never mounted into containers
+- Never allowed into sandboxes
 - Cannot be modified by agents
 
 **Default Blocked Patterns:**
@@ -71,7 +70,7 @@ Messages and task operations are verified against group identity:
 - Any credentials matching blocked patterns
 
 **Credential Filtering:**
-Only this environment variable is exposed to containers:
+Only this environment variable is exposed to sandboxed processes:
 ```typescript
 const allowedVars = ['OPENAI_API_KEY'];
 ```
@@ -80,9 +79,9 @@ const allowedVars = ['OPENAI_API_KEY'];
 
 | Capability | Main Group | Non-Main Group |
 |------------|------------|----------------|
-| Project root access | `/workspace/project` (rw) | None |
-| Group folder | `/workspace/group` (rw) | `/workspace/group` (rw) |
-| Global memory | Implicit via project | `/workspace/global` (ro) |
+| Project root access | Write allowlisted | None |
+| Group folder | Write allowlisted | Write allowlisted |
+| Global memory | Readable | Readable |
 | Additional mounts | Configurable | Read-only unless allowed |
 | Network access | Unrestricted | Unrestricted |
 | IPC tools | All | All |
@@ -107,10 +106,10 @@ const allowedVars = ['OPENAI_API_KEY'];
                                  │
                                  ▼ Explicit mounts only
 ┌──────────────────────────────────────────────────────────────────┐
-│                CONTAINER (ISOLATED/SANDBOXED)                     │
+│                SANDBOX (ISOLATED)                                 │
 │  • Agent execution                                                │
 │  • Bash commands (sandboxed)                                      │
-│  • File operations (limited to mounts)                            │
+│  • File operations (writes limited to allowlist)                  │
 │  • Network access (unrestricted)                                  │
 │  • Cannot modify security config                                  │
 └──────────────────────────────────────────────────────────────────┘

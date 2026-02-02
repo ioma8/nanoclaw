@@ -1,6 +1,6 @@
 /**
- * Container Runner for NanoClaw
- * Spawns agent execution in Docker and handles IPC
+ * Sandbox Runner for NanoClaw
+ * Spawns agent execution in a local sandbox and handles IPC
  */
 
 import { spawn } from 'child_process';
@@ -8,6 +8,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import pino from 'pino';
+import { SandboxManager, type SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
 import {
   CONTAINER_IMAGE,
   CONTAINER_TIMEOUT,
@@ -116,31 +117,7 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
     readonly: false
   });
 
-  // Environment file directory (limits exposed vars)
-  // Only expose specific auth variables needed by the agent, not the entire .env
-  const envDir = path.join(DATA_DIR, 'env');
-  fs.mkdirSync(envDir, { recursive: true });
-  const envFile = path.join(projectRoot, '.env');
-  if (fs.existsSync(envFile)) {
-    const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = ['OPENAI_API_KEY'];
-    const filteredLines = envContent
-      .split('\n')
-      .filter(line => {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) return false;
-        return allowedVars.some(v => trimmed.startsWith(`${v}=`));
-      });
-
-    if (filteredLines.length > 0) {
-      fs.writeFileSync(path.join(envDir, 'env'), filteredLines.join('\n') + '\n');
-      mounts.push({
-        hostPath: envDir,
-        containerPath: '/workspace/env-dir',
-        readonly: true
-      });
-    }
-  }
+  // Environment variables are passed directly to the sandboxed process.
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
@@ -155,21 +132,47 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
   return mounts;
 }
 
-function buildContainerArgs(mounts: VolumeMount[]): string[] {
-  const args: string[] = ['run', '-i', '--rm'];
+function buildSandboxConfig(mounts: VolumeMount[]): Partial<SandboxRuntimeConfig> {
+  const allowWrite = mounts.filter(m => !m.readonly).map(m => m.hostPath);
 
-  // Docker: use -v with :ro for readonly mounts
-  for (const mount of mounts) {
-    if (mount.readonly) {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}:ro`);
-    } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+  return {
+    filesystem: {
+      denyRead: [],
+      allowWrite,
+      denyWrite: []
+    }
+  };
+}
+
+function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function loadFilteredEnv(projectRoot: string): Record<string, string> {
+  const envFile = path.join(projectRoot, '.env');
+  const allowedVars = ['OPENAI_API_KEY'];
+  const result: Record<string, string> = {};
+
+  for (const key of allowedVars) {
+    if (process.env[key]) {
+      result[key] = process.env[key] as string;
     }
   }
 
-  args.push(CONTAINER_IMAGE);
+  if (!fs.existsSync(envFile)) return result;
 
-  return args;
+  const envContent = fs.readFileSync(envFile, 'utf-8');
+  for (const line of envContent.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const match = trimmed.match(/^([^=]+)=(.*)$/);
+    if (!match) continue;
+    const key = match[1];
+    if (!allowedVars.includes(key)) continue;
+    if (!(key in result)) result[key] = match[2];
+  }
+
+  return result;
 }
 
 export async function runContainerAgent(
@@ -182,12 +185,11 @@ export async function runContainerAgent(
   fs.mkdirSync(groupDir, { recursive: true });
 
   const mounts = buildVolumeMounts(group, input.isMain);
-  const containerArgs = buildContainerArgs(mounts);
+  const sandboxConfig = buildSandboxConfig(mounts);
 
   logger.debug({
     group: group.name,
-    mounts: mounts.map(m => `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`),
-    containerArgs: containerArgs.join(' ')
+    mounts: mounts.map(m => `${m.hostPath}${m.readonly ? ' (ro)' : ' (rw)'}`)
   }, 'Container mount configuration');
 
   logger.info({
@@ -199,9 +201,42 @@ export async function runContainerAgent(
   const logsDir = path.join(GROUPS_DIR, group.folder, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
+  const projectRoot = process.cwd();
+  const agentRunnerPath = path.join(projectRoot, 'container', 'agent-runner', 'dist', 'index.js');
+  const agentCommand = `node ${shellEscape(agentRunnerPath)}`;
+  let sandboxedCommand: string;
+  try {
+    sandboxedCommand = await SandboxManager.wrapWithSandbox(agentCommand, undefined, sandboxConfig);
+  } catch (err) {
+    logger.error({ group: group.name, error: err }, 'Failed to build sandbox command');
+    return {
+      status: 'error',
+      result: null,
+      error: `Sandbox setup failed: ${err instanceof Error ? err.message : String(err)}`
+    };
+  }
+
   return new Promise((resolve) => {
-    const container = spawn('docker', containerArgs, {
-      stdio: ['pipe', 'pipe', 'pipe']
+    const globalDir = path.join(GROUPS_DIR, 'global');
+    const groupSessionsDir = path.join(DATA_DIR, 'sessions', group.folder, 'openai');
+    const groupIpcDir = path.join(DATA_DIR, 'ipc', group.folder);
+    const filteredEnv = loadFilteredEnv(projectRoot);
+
+    const env = {
+      ...process.env,
+      ...filteredEnv,
+      NANOCLAW_GROUP_DIR: groupDir,
+      NANOCLAW_SESSIONS_DIR: groupSessionsDir,
+      NANOCLAW_IPC_DIR: groupIpcDir,
+      NANOCLAW_GLOBAL_DIR: fs.existsSync(globalDir) ? globalDir : '',
+      NANOCLAW_PROJECT_DIR: input.isMain ? projectRoot : ''
+    };
+
+    const container = spawn(sandboxedCommand, {
+      shell: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: groupDir,
+      env
     });
 
     let stdout = '';
@@ -252,7 +287,7 @@ export async function runContainerAgent(
       });
     }, group.containerConfig?.timeout || CONTAINER_TIMEOUT);
 
-    container.on('close', (code) => {
+    container.on('close', (code, signal) => {
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
 
@@ -266,7 +301,8 @@ export async function runContainerAgent(
         `Group: ${group.name}`,
         `IsMain: ${input.isMain}`,
         `Duration: ${duration}ms`,
-        `Exit Code: ${code}`,
+        `Exit Code: ${code ?? 'null'}`,
+        `Signal: ${signal ?? 'none'}`,
         `Stdout Truncated: ${stdoutTruncated}`,
         `Stderr Truncated: ${stderrTruncated}`,
         ``
@@ -277,11 +313,11 @@ export async function runContainerAgent(
           `=== Input ===`,
           JSON.stringify(input, null, 2),
           ``,
-          `=== Container Args ===`,
-          containerArgs.join(' '),
+          `=== Sandbox Command ===`,
+          sandboxedCommand,
           ``,
           `=== Mounts ===`,
-          mounts.map(m => `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`).join('\n'),
+          mounts.map(m => `${m.hostPath}${m.readonly ? ' (ro)' : ' (rw)'}`).join('\n'),
           ``,
           `=== Stderr${stderrTruncated ? ' (TRUNCATED)' : ''} ===`,
           stderr,
@@ -296,7 +332,7 @@ export async function runContainerAgent(
           `Session ID: ${input.sessionId || 'new'}`,
           ``,
           `=== Mounts ===`,
-          mounts.map(m => `${m.containerPath}${m.readonly ? ' (ro)' : ''}`).join('\n'),
+          mounts.map(m => `${m.hostPath}${m.readonly ? ' (ro)' : ' (rw)'}`).join('\n'),
           ``
         );
 
@@ -316,6 +352,7 @@ export async function runContainerAgent(
         logger.error({
           group: group.name,
           code,
+          signal,
           duration,
           stderr: stderr.slice(-500),
           logFile
@@ -324,7 +361,7 @@ export async function runContainerAgent(
         resolve({
           status: 'error',
           result: null,
-          error: `Container exited with code ${code}: ${stderr.slice(-200)}`
+          error: `Container exited with code ${code ?? 'null'}${signal ? ` (signal ${signal})` : ''}: ${stderr.slice(-200)}`
         });
         return;
       }

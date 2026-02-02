@@ -42,7 +42,7 @@ A personal OpenAI agent accessible via WhatsApp, with persistent memory per conv
 │  └────────┬─────────┘    └────────┬─────────┘    └───────────────┘  │
 │           │                       │                                  │
 │           └───────────┬───────────┘                                  │
-│                       │ spawns container                             │
+│                       │ spawns sandbox                               │
 │                       ▼                                              │
 ├─────────────────────────────────────────────────────────────────────┤
 │                  APPLE CONTAINER (Linux VM)                          │
@@ -58,7 +58,7 @@ A personal OpenAI agent accessible via WhatsApp, with persistent memory per conv
 │  │    • Additional dirs → /workspace/extra/*                      │   │
 │  │                                                                │   │
 │  │  Tools (all groups):                                           │   │
-│  │    • Bash (safe - sandboxed in container!)                     │   │
+│  │    • Bash (safe - sandboxed)                                   │   │
 │  │    • read_file, write_file, list_files (file ops)              │   │
 │  │    • bash (shell commands)                                     │   │
 │  │    • web_search (internet access)                              │   │
@@ -75,7 +75,7 @@ A personal OpenAI agent accessible via WhatsApp, with persistent memory per conv
 |-----------|------------|---------|
 | WhatsApp Connection | Node.js (@whiskeysockets/baileys) | Connect to WhatsApp, send/receive messages |
 | Message Storage | SQLite (better-sqlite3) | Store messages for polling |
-| Container Runtime | Docker | Isolated containers for agent execution |
+| Sandbox Runtime | @anthropic-ai/sandbox-runtime | macOS sandbox for agent execution |
 | Agent | @openai/agents | Run OpenAI Agents SDK with hosted + local tools |
 | Runtime | Node.js 20+ | Host process for routing and scheduling |
 
@@ -104,12 +104,12 @@ nanoclaw/
 │   ├── db.ts                      # Database initialization and queries
 │   ├── whatsapp-auth.ts           # Standalone WhatsApp authentication
 │   ├── task-scheduler.ts          # Runs scheduled tasks when due
-│   └── container-runner.ts        # Spawns agents in Docker containers
+│   └── container-runner.ts        # Spawns agents via Sandbox Runtime
 │
 ├── container/
-│   ├── Dockerfile                 # Container image (runs as 'node' user)
-│   ├── build.sh                   # Build script for container image
-│   ├── agent-runner/              # Code that runs inside the container
+│   ├── Dockerfile                 # Legacy container image (unused on macOS)
+│   ├── build.sh                   # Build script for agent runner
+│   ├── agent-runner/              # Code that runs inside the sandbox
 │   │   ├── package.json
 │   │   ├── tsconfig.json
 │   │   └── src/
@@ -127,7 +127,7 @@ nanoclaw/
 │       ├── customize/
 │       │   └── SKILL.md           # /customize skill
 │       └── debug/
-│           └── SKILL.md           # /debug skill (container debugging)
+│           └── SKILL.md           # /debug skill (sandbox debugging)
 │
 ├── groups/
 │   ├── CLAUDE.md                  # Global memory (all groups read this)
@@ -147,13 +147,12 @@ nanoclaw/
 │   ├── sessions.json              # Active session IDs per group
 │   ├── registered_groups.json     # Group JID → folder mapping
 │   ├── router_state.json          # Last processed timestamp + last agent timestamps
-│   ├── env/env                    # Copy of .env for container mounting
-│   └── ipc/                       # Container IPC (messages/, tasks/)
+│   └── ipc/                       # Sandbox IPC (messages/, tasks/)
 │
 ├── logs/                          # Runtime logs (gitignored)
 │   ├── nanoclaw.log               # Host stdout
 │   └── nanoclaw.error.log         # Host stderr
-│   # Note: Per-container logs are in groups/{folder}/logs/container-*.log
+│   # Note: Per-run logs are in groups/{folder}/logs/container-*.log
 │
 └── launchd/
     └── com.nanoclaw.plist         # macOS service configuration
@@ -172,7 +171,7 @@ export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'Andy';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
-// Paths are absolute (required for container mounts)
+// Paths are absolute (required for sandbox allowlists)
 const PROJECT_ROOT = process.cwd();
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
@@ -186,9 +185,9 @@ export const IPC_POLL_INTERVAL = 1000;
 export const TRIGGER_PATTERN = new RegExp(`^@${ASSISTANT_NAME}\\b`, 'i');
 ```
 
-**Note:** Paths must be absolute for Docker volume mounts to work correctly.
+**Note:** Paths must be absolute for sandbox allowlists to work correctly.
 
-### Container Configuration
+### Sandbox Configuration
 
 Groups can have additional directories mounted via `containerConfig` in `data/registered_groups.json`:
 
@@ -213,9 +212,7 @@ Groups can have additional directories mounted via `containerConfig` in `data/re
 }
 ```
 
-Additional mounts appear at `/workspace/extra/{containerPath}` inside the container.
-
-**Docker mount syntax note:** Read-write mounts use `-v host:container`. Read-only mounts can use `-v host:container:ro`.
+Additional mounts appear at `/workspace/extra/{containerPath}` inside the sandboxed view.
 
 ### OpenAI Authentication
 
@@ -225,7 +222,7 @@ Configure authentication in a `.env` file in the project root:
 OPENAI_API_KEY=sk-...
 ```
 
-Only the authentication variable (`OPENAI_API_KEY`) is extracted from `.env` and mounted into the container at `/workspace/env-dir/env`, then sourced by the entrypoint script. This ensures other environment variables in `.env` are not exposed to the agent.
+Only the authentication variable (`OPENAI_API_KEY`) is extracted from `.env` and passed to the sandboxed agent process. This ensures other environment variables in `.env` are not exposed to the agent.
 
 ### Changing the Assistant Name
 
@@ -277,7 +274,7 @@ NanoClaw uses a hierarchical memory system based on CLAUDE.md files.
    - Only the "main" group (self-chat) can write to global memory
    - Main can manage registered groups and schedule tasks for any group
    - Main can configure additional directory mounts for any group
-   - All groups have Bash access (safe because it runs inside container)
+   - All groups have Bash access (safe because it runs inside the sandbox)
 
 ---
 
@@ -476,13 +473,13 @@ NanoClaw runs as a single macOS launchd service.
 ### Startup Sequence
 
 When NanoClaw starts, it:
-1. **Ensures Docker is running** - Required for agent containers
+1. **Ensures sandbox prerequisites are available** - Required for agent sandboxing
 2. Initializes the SQLite database
 3. Loads state (registered groups, sessions, router state)
 4. Connects to WhatsApp
 5. Starts the message polling loop
 6. Starts the scheduler loop
-7. Starts the IPC watcher for container messages
+7. Starts the IPC watcher for sandbox messages
 
 ### Service: com.nanoclaw
 
@@ -545,14 +542,13 @@ tail -f logs/nanoclaw.log
 
 ## Security Considerations
 
-### Container Isolation
+### Sandbox Isolation
 
-All agents run inside Docker containers, providing:
-- **Filesystem isolation**: Agents can only access mounted directories
-- **Safe Bash access**: Commands run inside the container, not on your Mac
-- **Network isolation**: Can be configured per-container if needed
-- **Process isolation**: Container processes can't affect the host
-- **Non-root user**: Container runs as unprivileged `node` user (uid 1000)
+All agents run inside Sandbox Runtime sandboxes, providing:
+- **Filesystem isolation**: Writes are restricted to allowlisted paths
+- **Safe Bash access**: Commands run inside the sandbox, not on your Mac
+- **Network isolation**: Allowed by default for API/web access
+- **Process isolation**: Sandboxed processes can't affect the host
 
 ### Prompt Injection Risk
 
@@ -595,7 +591,7 @@ chmod 700 groups/
 | Issue | Cause | Solution |
 |-------|-------|----------|
 | No response to messages | Service not running | Check `launchctl list | grep nanoclaw` |
-| "Agent runner exited with code 1" | Docker daemon unavailable | Check Docker Desktop and restart NanoClaw |
+| "Agent runner exited with code 1" | Sandbox Runtime unavailable | Check macOS sandbox availability and restart NanoClaw |
 | "Agent runner exited with code 1" | Session mount path wrong | Ensure mount is to `/workspace/sessions` |
 | Session not continuing | Session ID not saved | Check `data/sessions.json` |
 | Session not continuing | Mount path mismatch | Sessions must be mounted at `/workspace/sessions` |

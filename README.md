@@ -3,14 +3,14 @@
 </p>
 
 <p align="center">
-  My personal OpenAI assistant that runs securely in containers. Lightweight and built to be understood and customized for your own needs.
+  My personal OpenAI assistant that runs securely in sandboxes. Lightweight and built to be understood and customized for your own needs.
 </p>
 
 ## Why I Built This
 
 [OpenClaw](https://github.com/openclaw/openclaw) is an impressive project with a great vision. But I can't sleep well running software I don't understand with access to my life. OpenClaw has 52+ modules, 8 config management files, 45+ dependencies, and abstractions for 15 channel providers. Security is application-level (allowlists, pairing codes) rather than OS isolation. Everything runs in one Node process with shared memory.
 
-NanoClaw gives you the same core functionality in a codebase you can understand in 8 minutes. One process. A handful of files. Agents run in actual Linux containers with filesystem isolation, not behind permission checks.
+NanoClaw gives you the same core functionality in a codebase you can understand in 8 minutes. One process. A handful of files. Agents run in macOS sandboxes with OS-level filesystem isolation, not behind permission checks.
 
 ## Quick Start
 
@@ -20,13 +20,13 @@ cd nanoclaw
 claude
 ```
 
-Then run `/setup`. Claude Code handles everything: dependencies, authentication, container setup, service configuration.
+Then run `/setup`. Claude Code handles everything: dependencies, authentication, sandbox setup, service configuration.
 
 ## Philosophy
 
 **Small enough to understand.** One process, a few source files. No microservices, no message queues, no abstraction layers. Have Claude Code walk you through it.
 
-**Secure by isolation.** Agents run in Docker containers. They can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your host.
+**Secure by isolation.** Agents run in macOS sandboxes via the Sandbox Runtime. Write access is explicitly allowlisted. Bash access is safe because commands run inside the sandbox, not on your host.
 
 **Built for one user.** This isn't a framework. It's working software that fits my exact needs. You fork it and have Claude Code make it match your exact needs.
 
@@ -43,11 +43,11 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 ## What It Supports
 
 - **WhatsApp I/O** - Message the assistant from your phone
-- **Isolated group context** - Each group has its own `CLAUDE.md` memory, isolated filesystem, and runs in its own container sandbox with only that filesystem mounted
+- **Isolated group context** - Each group has its own `CLAUDE.md` memory and runs in its own sandbox with only its write paths allowed
 - **Main channel** - Your private channel (self-chat) for admin control; every other group is completely isolated
 - **Scheduled tasks** - Recurring jobs that run the agent and can message you back
 - **Web access** - Search and fetch content
-- **Container isolation** - Agents sandboxed in Docker (macOS/Linux)
+- **Sandbox isolation** - Agents sandboxed with `@anthropic-ai/sandbox-runtime` (macOS only)
 - **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
 
 ## Usage
@@ -98,18 +98,18 @@ Skills we'd love to see:
 - `/add-discord` - Add Discord
 
 **Platform Support**
-- `/setup-windows` - Windows via WSL2 + Docker
+- `/setup-windows` - Not supported in this macOS-only setup
 
 **Session Management**
 - `/add-clear` - Add a `/clear` command that compacts the conversation (summarizes context while preserving critical information in the same session). Requires figuring out how to trigger compaction programmatically via the OpenAI Agents SDK.
 
 ## Requirements
 
-- macOS or Linux
+- macOS
 - Node.js 20+
 - OpenAI API key (`OPENAI_API_KEY`)
 - [Claude Code](https://claude.ai/download)
-- [Docker](https://docker.com/products/docker-desktop) (macOS/Linux)
+- `sandbox-exec` (built into macOS, used by the Sandbox Runtime)
 
 ## Architecture
 
@@ -117,11 +117,11 @@ Skills we'd love to see:
 WhatsApp (baileys) --> SQLite --> Polling loop --> Container (OpenAI Agents SDK) --> Response
 ```
 
-Single Node.js process. Agents execute in isolated Linux containers with mounted directories. IPC via filesystem. No daemons, no queues, no complexity.
+Single Node.js process. Agents execute in isolated macOS sandboxes with allowlisted write paths. IPC via filesystem. No daemons, no queues, no complexity.
 
 Key files:
 - `src/index.ts` - Main app: WhatsApp connection, routing, IPC
-- `src/container-runner.ts` - Spawns agent containers
+- `src/container-runner.ts` - Spawns sandboxed agent runs
 - `src/task-scheduler.ts` - Runs scheduled tasks
 - `src/db.ts` - SQLite operations
 - `groups/*/CLAUDE.md` - Per-group memory
@@ -132,17 +132,17 @@ Key files:
 
 Because I use WhatsApp. Fork it and run a skill to change it. That's the whole point.
 
-**Why Docker?**
+**Why Sandbox Runtime?**
 
-It’s widely available, stable, and works across macOS and Linux.
+It’s fast to start and enforces OS-level filesystem isolation using macOS sandboxing primitives.
 
 **Can I run this on Linux?**
 
-Yes. Run `/setup` and it will configure Docker as the container runtime.
+Not in this macOS-only version. Linux support would require bubblewrap wiring.
 
 **Is this secure?**
 
-Agents run in containers, not behind application-level permission checks. They can only access explicitly mounted directories. You should still review what you're running, but the codebase is small enough that you actually can. See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
+Agents run in sandboxes, not behind application-level permission checks. They can only access explicitly allowed directories. You should still review what you're running, but the codebase is small enough that you actually can. See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
 
 **Why no configuration files?**
 

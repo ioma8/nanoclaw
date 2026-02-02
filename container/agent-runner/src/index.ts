@@ -42,9 +42,10 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 const DEFAULT_SHELL_TIMEOUT_MS = 60_000;
 const DEFAULT_SHELL_MAX_OUTPUT = 8_000;
 const DEFAULT_READ_MAX_BYTES = 200_000;
-const SESSIONS_DIR = '/workspace/sessions';
-const GROUP_DIR = '/workspace/group';
-const PROJECT_DIR = '/workspace/project';
+const GROUP_DIR = process.env.NANOCLAW_GROUP_DIR || '/workspace/group';
+const PROJECT_DIR = process.env.NANOCLAW_PROJECT_DIR || '/workspace/project';
+const GLOBAL_DIR = process.env.NANOCLAW_GLOBAL_DIR || '/workspace/global';
+const SESSIONS_DIR = process.env.NANOCLAW_SESSIONS_DIR || '/workspace/sessions';
 
 async function readStdin(): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -67,14 +68,20 @@ function log(message: string): void {
 }
 
 function readOptionalFile(filePath: string): string {
-  if (!fs.existsSync(filePath)) return '';
-  return fs.readFileSync(filePath, 'utf-8');
+  try {
+    if (!fs.existsSync(filePath)) return '';
+    return fs.readFileSync(filePath, 'utf-8');
+  } catch {
+    return '';
+  }
 }
 
 function buildInstructions(): string {
   const groupInstructions = readOptionalFile(path.join(GROUP_DIR, 'CLAUDE.md'));
-  const globalInstructions = readOptionalFile('/workspace/global/CLAUDE.md')
-    || readOptionalFile(path.join(PROJECT_DIR, 'groups', 'global', 'CLAUDE.md'));
+  const globalBase = GLOBAL_DIR && GLOBAL_DIR.trim() ? GLOBAL_DIR : '';
+  const projectBase = PROJECT_DIR && PROJECT_DIR.trim() ? PROJECT_DIR : '';
+  const globalInstructions = (globalBase ? readOptionalFile(path.join(globalBase, 'CLAUDE.md')) : '')
+    || (projectBase ? readOptionalFile(path.join(projectBase, 'groups', 'global', 'CLAUDE.md')) : '');
 
   const parts = [globalInstructions, groupInstructions].filter(Boolean);
   if (parts.length === 0) {
@@ -173,7 +180,7 @@ async function runCommand(command: string, timeoutMs: number, maxOutputLength: n
     let stdout = '';
     let stderr = '';
     let finished = false;
-    const child = spawn('bash', ['-lc', command], {
+    const child = spawn('/bin/bash', ['-lc', command], {
       cwd,
       env: process.env
     });
@@ -239,7 +246,7 @@ function appendConversationLog(prompt: string, output: string | null): void {
 function createLocalTools(allowedRoots: string[]) {
   const bashTool = tool({
     name: 'bash',
-    description: 'Run a bash command inside the container. Use for file operations and local scripts.',
+    description: 'Primary and working bash execution tool. Use it to run commands of all kinds. It is safe because commands run inside the sandbox.',
     parameters: z.object({
       command: z.string().describe('Bash command to run')
     }),
