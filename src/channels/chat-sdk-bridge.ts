@@ -1,0 +1,1724 @@
+/**
+ * Chat SDK bridge — wraps a Chat SDK adapter + Chat instance
+ * to conform to the NanoClaw ChannelAdapter interface.
+ *
+ * Used by Discord, Slack, and other Chat SDK-supported platforms.
+ */
+import { createHash, timingSafeEqual } from 'crypto';
+import http from 'http';
+
+import {
+  Chat,
+  Card,
+  CardText,
+  Actions,
+  Button,
+  Chart,
+  Divider,
+  Field,
+  Fields,
+  LinkButton,
+  Table,
+  type CardChild,
+  type ActionEvent,
+  type Adapter,
+  type AssistantContextChangedEvent,
+  type AssistantThreadStartedEvent,
+  type ConcurrencyStrategy,
+  type Logger,
+  type Message as ChatMessage,
+} from 'chat';
+import { log } from '../log.js';
+import { SqliteStateAdapter } from '../state-sqlite.js';
+import { registerWebhookAdapter } from '../webhook-server.js';
+import { cardProblems, isCardPart, isRecord, type CardPart } from './card-parts.js';
+import { CardTooLongError, cardQuestionTooLong, normalizeOptions, type NormalizedOption } from './ask-question.js';
+import type { ChannelAdapter, ChannelDefaults, ChannelSetup, HistoryLine, InboundMessage } from './adapter.js';
+import { INSTANCE_KEY_RE } from './channel-registry.js';
+import { resolveQuestionRender, dispatchQuestionAction } from './question-render-registry.js';
+
+/** Adapter with optional gateway support (e.g., Discord). */
+interface GatewayAdapter extends Adapter {
+  startGatewayListener?(
+    options: { waitUntil?: (task: Promise<unknown>) => void },
+    durationMs?: number,
+    abortSignal?: AbortSignal,
+    webhookUrl?: string,
+  ): Promise<Response>;
+}
+
+/** Adapter that can expose authenticated transport liveness to host status. */
+interface ConnectionAwareAdapter extends Adapter {
+  isConnected?(): boolean;
+}
+
+/** Reply context extracted from a platform's raw message. */
+export interface ReplyContext {
+  text: string;
+  sender: string;
+}
+
+// ---------------------------------------------------------------------------
+// Agent-DM opened hook (assistant_thread_started)
+// ---------------------------------------------------------------------------
+
+/** The user opened an agent DM (assistant thread started). Registered by the
+ *  host to (re)assert onboarding prompts at a moment the user is provably
+ *  looking — prompt sets made before the DM was ever opened may not render. */
+export interface AgentDmOpenedEvent {
+  instance: string;
+  channelId: string;
+}
+
+let agentDmOpenedHandler: ((event: AgentDmOpenedEvent) => void | Promise<void>) | null = null;
+
+export function setAgentDmOpenedHandler(fn: (event: AgentDmOpenedEvent) => void | Promise<void>): void {
+  agentDmOpenedHandler = fn;
+}
+
+function dispatchAgentDmOpened(event: AgentDmOpenedEvent): void {
+  if (!agentDmOpenedHandler) return;
+  try {
+    Promise.resolve(agentDmOpenedHandler(event)).catch((err) =>
+      log.warn('Agent-DM opened handler failed', { channelId: event.channelId, err }),
+    );
+  } catch (err) {
+    log.warn('Agent-DM opened handler threw', { channelId: event.channelId, err });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Agent-mode app context
+// ---------------------------------------------------------------------------
+
+/** One "what the user is viewing" entity, rendered by the container formatter. */
+export interface AppContextEntity {
+  type: string;
+  id: string;
+}
+
+/**
+ * Latest assistant context per (instance, DM channel, user), attached to the
+ * NEXT inbound DM message as content.app_context and consumed. Platforms
+ * whose DM surface materializes threads and reports client context send
+ * app_context as its own event (assistant_thread_started /
+ * assistant_thread_context_changed), not on the message payload, so the
+ * bridge has to hold it across the event → message gap. Short TTL: a stale
+ * "viewing X" is worse than none.
+ */
+const APP_CONTEXT_TTL_MS = 5 * 60 * 1000;
+const appContextCache = new Map<string, { entities: AppContextEntity[]; at: number }>();
+
+/** Channel ids arrive both raw ("D0123") and platform-encoded ("slack:D0123")
+ *  depending on the emitting path — key on the final segment so both match. */
+function appContextKey(instance: string, channelId: string, userId: string): string {
+  const channel = channelId.includes(':') ? channelId.slice(channelId.lastIndexOf(':') + 1) : channelId;
+  return `${instance}|${channel}|${userId}`;
+}
+
+/**
+ * Derive ordered entities from an SDK assistant event. The installed chat
+ * core (4.41.1) parses assistant_thread_started /
+ * assistant_thread_context_changed into a `context` object (channelId/teamId/threadEntryPoint — the legacy assistant
+ * context shape) with no entities array; prefer a real `entities` array
+ * whenever a future SDK forwards the platform's ordered agent-context
+ * entities.
+ */
+export function appContextEntities(
+  event: AssistantThreadStartedEvent | AssistantContextChangedEvent,
+): AppContextEntity[] {
+  const raw = event as unknown as Record<string, unknown>;
+  const direct = raw.entities ?? (raw.context as Record<string, unknown> | undefined)?.entities;
+  if (Array.isArray(direct)) {
+    return direct
+      .map((e) => {
+        const entity = e as Record<string, unknown> | null;
+        const type = typeof entity?.type === 'string' ? entity.type : '';
+        const idValue = entity?.id ?? entity?.channel_id ?? entity?.entity_id;
+        const id = typeof idValue === 'string' ? idValue : '';
+        return { type, id };
+      })
+      .filter((e) => e.type !== '' && e.id !== '');
+  }
+  const channelId = event.context?.channelId;
+  return typeof channelId === 'string' && channelId ? [{ type: 'channel', id: channelId }] : [];
+}
+
+export function cacheAppContext(
+  instance: string,
+  channelId: string,
+  userId: string,
+  entities: AppContextEntity[],
+  now = Date.now(),
+): void {
+  const key = appContextKey(instance, channelId, userId);
+  if (entities.length === 0) {
+    appContextCache.delete(key);
+    return;
+  }
+  appContextCache.set(key, { entities, at: now });
+}
+
+/** Consume the cached context (single-shot: it describes what the user was
+ *  viewing when they sent the NEXT message, not every message after). */
+export function takeAppContext(
+  instance: string,
+  channelId: string,
+  userId: string,
+  now = Date.now(),
+): AppContextEntity[] | undefined {
+  const key = appContextKey(instance, channelId, userId);
+  const hit = appContextCache.get(key);
+  if (!hit) return undefined;
+  appContextCache.delete(key);
+  if (now - hit.at > APP_CONTEXT_TTL_MS) return undefined;
+  return hit.entities;
+}
+
+/**
+ * Attach the cached app context to an inbound DM message's content JSON
+ * (content.app_context = { entities: [...] }). A context the SDK attached
+ * directly on the message payload wins — the cache only fills the
+ * event → message gap.
+ */
+export function attachAppContext(
+  content: Record<string, unknown>,
+  instance: string,
+  channelId: string,
+  userId: string | undefined,
+): void {
+  if (content.app_context) return;
+  if (!userId) return;
+  const entities = takeAppContext(instance, channelId, userId);
+  if (entities && entities.length > 0) {
+    content.app_context = { entities };
+  }
+}
+
+/**
+ * Base64-encode attachment bytes. Adapters may return ArrayBuffer (Telegram
+ * since 4.39), whose toString() yields "[object ArrayBuffer]", not bytes.
+ */
+export function attachmentBytesToBase64(data: Buffer | ArrayBuffer | Uint8Array): string {
+  if (Buffer.isBuffer(data)) return data.toString('base64');
+  if (data instanceof Uint8Array) return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('base64');
+  return Buffer.from(data).toString('base64');
+}
+
+/**
+ * The Chat SDK reports a handler that throws or a failed state write only
+ * through its logger, so `logger: 'silent'` dropped such a message without a
+ * trace. Warn and error reach our log; the SDK's debug and info lines go to
+ * our debug level, except the info lines that report a lost inbound message.
+ */
+export function chatSdkLogger(prefix = 'chat-sdk'): Logger {
+  const to =
+    (level: 'debug' | 'warn' | 'error') =>
+    (message: string, ...args: unknown[]) =>
+      log[level](`${prefix}: ${message}`, sdkLogData(args));
+  return {
+    child: (name: string) => chatSdkLogger(`${prefix}:${name}`),
+    // SDK debug lines print each message's full text; drop them.
+    debug: () => {},
+    info: (message, ...args) => to(isLostMessage(message, args[0]) ? 'warn' : 'debug')(message, ...args),
+    warn: to('warn'),
+    error: to('error'),
+  };
+}
+
+/**
+ * In queue mode the SDK drops a held message that waited past its TTL, and
+ * passes older held messages over for the newest (our handlers ignore the
+ * skipped list). It reports both only at info.
+ */
+function isLostMessage(message: string, data: unknown): boolean {
+  if (message === 'message-expired') return true;
+  return (
+    message === 'message-dequeued' && isRecord(data) && typeof data.skippedCount === 'number' && data.skippedCount > 0
+  );
+}
+
+/** Message-text fields the SDK puts in its log data. */
+const SDK_TEXT_KEYS = new Set(['text', 'messageText']);
+
+/**
+ * Our log prints an Error's message and stack only under `err`; the SDK passes
+ * it as `error`. Message text is cut to its length, a URL to its origin and an
+ * action id to its first two parts (old question cards carry the answer there).
+ */
+function sdkLogData(args: unknown[]): Record<string, unknown> | undefined {
+  const data: Record<string, unknown> = {};
+  const extra: unknown[] = [];
+  for (const arg of args) {
+    if (arg instanceof Error) data.err ??= arg;
+    else if (isRecord(arg)) {
+      for (const [key, value] of Object.entries(arg)) {
+        if (value instanceof Error && data.err === undefined) data.err = value;
+        else if (typeof value === 'string' && SDK_TEXT_KEYS.has(key)) data[key] = `[${value.length} chars]`;
+        else if (typeof value === 'string' && key === 'actionId') data[key] = actionIdHead(value);
+        else data[key] = typeof value === 'string' ? urlOrigin(value) : value;
+      }
+    } else if (arg !== undefined) extra.push(arg);
+  }
+  if (extra.length > 0) data.args = extra;
+  return Object.keys(data).length > 0 ? data : undefined;
+}
+
+function actionIdHead(value: string): string {
+  const parts = value.split(':');
+  return parts.length > 2 ? `${parts.slice(0, 2).join(':')}:…` : value;
+}
+
+function urlOrigin(value: string): string {
+  if (!/^https?:\/\//i.test(value)) return value;
+  return URL.canParse(value) ? `${new URL(value).origin}/…` : '[url]';
+}
+
+/**
+ * Root-thread a top-level DM message: on platforms whose DM surface
+ * materializes conversation threads (agent-view semantics), every top-level
+ * DM message is the root of a conversation thread — replying in-thread and
+ * setting per-thread status on that ts is what OPENS the thread in the
+ * client. Such adapters map top-level DM messages to an EMPTY threadTs
+ * (`…:<channel>:`), so without this the thread never materializes: no
+ * in-thread reply, no status target, no per-thread session.
+ *
+ * The message id is the platform ts for chat-sdk adapters, so appending it to
+ * the dangling `:` yields the canonical thread id. Plain (non-agent) DM
+ * wirings are unaffected downstream: the router strips thread ids when the
+ * wiring's thread policy is off, restoring today's top-level behavior.
+ */
+export function normalizeDmThreadId(threadId: string, messageId: string): string {
+  if (threadId.endsWith(':') && messageId && !messageId.includes(':')) {
+    return threadId + messageId;
+  }
+  return threadId;
+}
+
+/** Extract reply context from a platform-specific raw message. Return null if no reply. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type ReplyContextExtractor = (raw: Record<string, any>) => ReplyContext | null;
+
+/**
+ * Recover readable content a platform adapter left only in `message.raw`.
+ *
+ * The bridge drops `raw` before persisting (it can be very large), so anything
+ * the adapter did not project into `Message.toJSON()` is lost at that point.
+ * A platform that carries readable content outside the normal text — Slack
+ * puts pasted tables in `attachments[].blocks[]` — returns it here as text.
+ * Return null when there is nothing to recover.
+ */
+export type RawTextExtractor = (raw: Record<string, unknown>) => string | null;
+
+// ---------------------------------------------------------------------------
+// Membership hook
+// ---------------------------------------------------------------------------
+
+/**
+ * A member joined (or left) a channel/group conversation one of our bridge
+ * instances is in. Forwarded from the Chat SDK's member_joined_channel
+ * dispatch; `left` is reserved for member_left_channel, which the installed
+ * chat core (4.41.1) does NOT dispatch — see the TODO at the
+ * onMemberJoinedChannel registration in setup().
+ */
+export interface MembershipEvent {
+  /** Adapter-instance key of the bridge that saw the event (defaults to the
+   *  platform name for default instances). */
+  instance: string;
+  /** Semantic platform key (`adapter.name`) — the key membership handlers
+   *  are registered under. */
+  channelType: string;
+  channelId: string;
+  userId: string;
+  inviterId?: string;
+  left?: boolean;
+}
+
+export type MembershipHandler = (event: MembershipEvent) => void | Promise<void>;
+
+const membershipHandlers = new Map<string, MembershipHandler>();
+
+/**
+ * Register THE membership handler for a channel type (single registration —
+ * one channel-side module owns it; a second registration for the same
+ * channel type overwrites with a warning, mirroring the router's hook
+ * discipline). The bridge invokes it fire-and-forget for every membership
+ * event on every bridge instance of that channel type; errors are logged,
+ * never thrown into SDK dispatch. With no handler registered the bridge
+ * behaves exactly as before.
+ */
+export function setMembershipHandler(channelType: string, fn: MembershipHandler): void {
+  if (membershipHandlers.has(channelType)) {
+    log.warn('Membership handler overwritten', { channelType });
+  }
+  membershipHandlers.set(channelType, fn);
+}
+
+function dispatchMembership(event: MembershipEvent): void {
+  const handler = membershipHandlers.get(event.channelType);
+  if (!handler) return;
+  try {
+    Promise.resolve(handler(event)).catch((err) =>
+      log.error('Membership handler failed', {
+        channelType: event.channelType,
+        channelId: event.channelId,
+        userId: event.userId,
+        err,
+      }),
+    );
+  } catch (err) {
+    log.error('Membership handler threw', {
+      channelType: event.channelType,
+      channelId: event.channelId,
+      userId: event.userId,
+      err,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Inbound policy registration
+// ---------------------------------------------------------------------------
+
+/**
+ * Wrap of the host's `ChannelSetup`, applied at bridge setup time. Every
+ * inbound dispatch path (onSubscribedMessage / onNewMention / onDirectMessage
+ * / onNewMessage) funnels through the stored setup's `onInbound`, so a policy
+ * that wraps `onInbound` intercepts them all at a single point — e.g. to
+ * drop, re-attribute, or rate-limit bot-authored messages before routing.
+ *
+ * `instanceKey` is the bridge's registry key (`config.instance ??
+ * adapter.name`): the wrap runs once per bridge instance, so policy state
+ * captured in the returned closure is naturally per-instance (= per bot
+ * identity when several bridges share one platform).
+ */
+export type BridgeInboundPolicy = (setup: ChannelSetup, instanceKey: string) => ChannelSetup | Promise<ChannelSetup>;
+
+const bridgeInboundPolicies = new Map<string, BridgeInboundPolicy>();
+
+/**
+ * Register THE inbound policy for a channel type (single registration — the
+ * owning module registers on barrel import; a second registration overwrites
+ * with a warning, mirroring the router's hook discipline). Bridges whose
+ * channel type has no registered policy are unaffected.
+ */
+export function registerBridgeInboundPolicy(channelType: string, wrap: BridgeInboundPolicy): void {
+  if (bridgeInboundPolicies.has(channelType)) {
+    log.warn('Bridge inbound policy overwritten', { channelType });
+  }
+  bridgeInboundPolicies.set(channelType, wrap);
+}
+
+export interface ChatSdkBridgeConfig {
+  adapter: Adapter;
+  /**
+   * Adapter-instance name for running multiple bridges of one platform
+   * (e.g. several Slack apps in one workspace). Defaults to the platform
+   * name. Drives the registry key, the webhook route (/webhook/<instance>),
+   * and the Chat SDK state namespace. channelType is NOT affected — user
+   * identity, formatting, and container config stay keyed on the platform.
+   * Must be URL-safe: non-empty, only letters, digits, '.', '_' or '-'.
+   */
+  instance?: string;
+  concurrency?: ConcurrencyStrategy;
+  /** Bot token for authenticating forwarded Gateway events (required for interaction handling). */
+  botToken?: string;
+  /** Platform-specific reply context extraction. */
+  extractReplyContext?: ReplyContextExtractor;
+  /**
+   * Recover readable content the platform adapter left only in `message.raw`.
+   * The returned text is appended to the message body and persisted; the raw
+   * provider payload is still dropped.
+   */
+  extractRawText?: RawTextExtractor;
+  /**
+   * Whether this platform uses threads as the primary conversation unit.
+   * See `ChannelAdapter.supportsThreads`. Declared by the calling channel
+   * skill, not inferred, because some platforms (Discord) can be used either
+   * way and the default depends on installation style.
+   */
+  supportsThreads: boolean;
+  /**
+   * Declared wiring-time defaults for this channel. Copied verbatim onto the
+   * returned ChannelAdapter, exactly like supportsThreads. See
+   * `ChannelAdapter.defaults`.
+   */
+  defaults?: ChannelDefaults;
+  /**
+   * Optional transform applied to outbound text/markdown before it reaches the
+   * adapter. Used by channels that need to sanitize for a platform-specific
+   * quirk (e.g. Telegram's legacy Markdown parse mode).
+   */
+  transformOutboundText?: (text: string) => string;
+  /**
+   * Optional escape for host-built ask_question card text (open and resolved
+   * cards). Approval cards mix host wording with untrusted values (agent
+   * arguments, sender names); channels whose card text is raw platform markup
+   * set this. Questions an agent asks itself (`fromAgent`) keep their markup.
+   */
+  escapeCardText?: (text: string) => string;
+  /** Override title encoding when the adapter already handles plain card titles. */
+  escapeCardTitle?: (title: string) => string;
+  /**
+   * For a platform that caps a whole card's text: the longest ask_question
+   * title plus card text (after escapeCardText) it shows in full. A longer
+   * card is refused with CardTooLongError. Unset, long card text is posted
+   * in several text blocks, each under CARD_TEXT_BLOCK_LENGTH.
+   */
+  maxCardTextLength?: number;
+  /**
+   * Maximum text length the underlying adapter accepts in a single message.
+   * When set, the bridge splits outbound text longer than this on paragraph
+   * → line → hard-char boundaries and posts multiple messages. Without this,
+   * adapters like Discord (2000) and Telegram (4096) silently truncate
+   * mid-response. The returned id is the first chunk's id so subsequent edits
+   * and reactions still target the head of the reply.
+   */
+  maxTextLength?: number;
+}
+
+/**
+ * Split `text` into chunks no larger than `limit`, preferring paragraph
+ * breaks, then line breaks, then a hard character cut as a last resort.
+ * Preserves code fences only structurally — a fenced block that straddles a
+ * chunk boundary will render as two independent blocks on the receiving
+ * platform, which is the same behavior as manually re-opening a fence.
+ */
+/**
+ * Decode the actual option value from a button callback. Buttons are encoded
+ * with an integer index (to keep under Telegram's 64-byte callback_data cap),
+ * and the real value is looked up via `resolveQuestionRender(questionId)`.
+ * Falls back to treating the tail as a literal value so old in-flight cards
+ * (encoded before this shortening landed) still resolve.
+ */
+function resolveSelectedOption(
+  render: { options: NormalizedOption[] } | undefined,
+  eventValue: string | undefined,
+  tail: string | undefined,
+): string {
+  const candidate = eventValue ?? tail ?? '';
+  if (render && /^\d+$/.test(candidate)) {
+    const idx = Number(candidate);
+    if (render.options[idx]) return render.options[idx].value;
+  }
+  return candidate;
+}
+
+interface TerminalApprovalCard {
+  title: string;
+  question: string;
+  /** The question as separate text blocks, when it was split to fit. */
+  questionBlocks?: string[];
+  resolution: string;
+  /** The question is the agent's own markup: don't escape it (the resolution still is). */
+  fromAgent?: boolean;
+}
+
+/**
+ * Keep an approval's full context after it resolves. The muted resolution
+ * replaces the actions row, making the card visibly inactive without
+ * discarding the request an admin decided on.
+ */
+export function buildTerminalApprovalCard({ title, question, questionBlocks, resolution }: TerminalApprovalCard) {
+  const children: CardChild[] = [];
+  for (const block of questionBlocks ?? (question ? [question] : [])) children.push(CardText(block));
+  children.push(CardText(resolution, { style: 'muted' }));
+  return Card({ title, children });
+}
+
+function terminalApprovalMessage(spec: TerminalApprovalCard) {
+  return {
+    card: buildTerminalApprovalCard(spec),
+    fallbackText: [spec.title, spec.question, spec.resolution].filter(Boolean).join('\n\n'),
+  };
+}
+
+/**
+ * Longest text in one card text block. Some platforms cap each block, and an
+ * adapter can still lengthen text (emoji names) after the bridge measures it.
+ */
+export const CARD_TEXT_BLOCK_LENGTH = 2000;
+
+/** Shown only to a clicker the host refused, where the channel can post privately. */
+const REFUSED_CLICK_NOTE = 'Only an approver can answer this.';
+/** A clicked card whose request is gone. */
+const CLOSED_RESOLUTION = 'No longer available';
+
+const FENCE = '```';
+/** A fence opens or closes only at the start of a line; backticks mid-line are text. */
+const FENCE_LINE = /^ {0,3}```/gm;
+
+/**
+ * Split card text into blocks of at most `limit` characters after `escape`, so
+ * a per-block cap never cuts one. Prefers a line break near the limit, never
+ * splits a surrogate pair or a fence marker, and closes and reopens a code
+ * fence that spans two blocks.
+ */
+export function splitCardText(text: string, escape: (t: string) => string, limit: number): string[] {
+  const blocks: string[] = [];
+  let rest = text;
+  let reopen = false;
+  const render = (raw: string) => {
+    const body = (reopen ? `${FENCE}\n` : '') + raw;
+    const open = (body.match(FENCE_LINE)?.length ?? 0) % 2 === 1;
+    return { block: escape(open ? `${body}\n${FENCE}` : body), open };
+  };
+  const fits = (n: number) => render(rest.slice(0, n)).block.length <= limit;
+  while (rest) {
+    let cut = rest.length;
+    if (!fits(cut)) {
+      // Longest prefix that fits; the search only ever keeps lengths that fit.
+      let lo = 0;
+      let hi = rest.length - 1;
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (fits(mid)) lo = mid;
+        else hi = mid - 1;
+      }
+      cut = lo;
+      const afterLine = rest.lastIndexOf('\n', cut - 1) + 1;
+      if (afterLine > cut / 2 && fits(afterLine)) cut = afterLine;
+      // Backing off a fence marker can change which fences close, so recheck.
+      const badCut = (n: number) => isHighSurrogate(rest.charCodeAt(n - 1)) || (rest[n - 1] === '`' && rest[n] === '`');
+      while (cut > 0 && (badCut(cut) || !fits(cut))) cut--;
+      if (cut === 0) throw new CardTooLongError('the request cannot be split into card text blocks');
+    }
+    const { block, open } = render(rest.slice(0, cut));
+    blocks.push(block);
+    rest = rest.slice(cut);
+    reopen = open;
+  }
+  return blocks;
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+export function splitForLimit(text: string, limit: number): string[] {
+  if (text.length <= limit) return [text];
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > limit) {
+    let cut = remaining.lastIndexOf('\n\n', limit);
+    if (cut <= 0) cut = remaining.lastIndexOf('\n', limit);
+    if (cut <= 0) cut = remaining.lastIndexOf(' ', limit);
+    if (cut <= 0) cut = limit;
+    // A lone half of an emoji can't be encoded: Slack's client throws "URI malformed" and retries for ~30 min.
+    if (cut > 1 && isHighSurrogate(remaining.charCodeAt(cut - 1))) cut--;
+    chunks.push(remaining.slice(0, cut).trimEnd());
+    remaining = remaining.slice(cut).trimStart();
+  }
+  if (remaining.length > 0) chunks.push(remaining);
+  return chunks;
+}
+
+/** How long split-reply progress is kept for a retry, host downtime included. */
+const SPLIT_PROGRESS_TTL_MS = 7 * 24 * 60 * 60_000;
+
+interface SplitProgress {
+  digest: string;
+  posted: number;
+  firstId?: string;
+}
+
+/**
+ * How many parts of one split reply are posted, kept in the bridge's state
+ * store so a delivery retry, even after a restart, resumes there. Kept after
+ * the last part too, for a retry after a failed delivery ack (the outbox files
+ * are gone by then, so they stay out of the digest). A changed text or limit
+ * starts over. Best effort: on a store error the retry posts from part 1.
+ */
+class SplitProgressStore {
+  private readonly key: string;
+  private readonly digest: string;
+  /** Set when the read failed: saving then could overwrite progress this attempt never saw. */
+  private unread = false;
+
+  constructor(
+    private readonly state: SqliteStateAdapter,
+    deliveryId: string,
+    threadId: string,
+    chunks: string[],
+  ) {
+    this.key = `split-progress:${deliveryId}`;
+    this.digest = createHash('sha256')
+      .update(JSON.stringify([threadId, chunks]))
+      .digest('hex');
+  }
+
+  async read(): Promise<SplitProgress | undefined> {
+    const saved = await this.attempt('read', () => this.state.get<SplitProgress>(this.key));
+    if (saved === undefined) this.unread = true; // a missing key reads as null
+    if (!saved || saved.digest !== this.digest) return undefined;
+    log.info('Resuming a split reply after the parts already posted', { key: this.key, posted: saved.posted });
+    return saved;
+  }
+
+  async save(posted: number, firstId: string | undefined): Promise<void> {
+    if (this.unread) return;
+    const progress: SplitProgress = { digest: this.digest, posted, firstId };
+    await this.attempt('save', () => this.state.set(this.key, progress, SPLIT_PROGRESS_TTL_MS));
+  }
+
+  private async attempt<T>(op: string, run: () => Promise<T>): Promise<T | undefined> {
+    try {
+      return await run();
+      // eslint-disable-next-line no-catch-all/no-catch-all -- progress is best effort; the send goes on without it
+    } catch (err) {
+      log.warn('Split reply progress unavailable', { op, key: this.key, err });
+      return undefined;
+    }
+  }
+}
+
+/**
+ * Append platform-rescued text to the serialized body, before `raw` is dropped.
+ * No extractor, or nothing recovered, leaves the body byte-identical.
+ */
+export function appendRawText(
+  serialized: Record<string, unknown>,
+  raw: Record<string, unknown>,
+  extract?: RawTextExtractor,
+): void {
+  if (!extract) return;
+  const extra = extract(raw);
+  if (!extra) return;
+  const text = typeof serialized.text === 'string' ? serialized.text : '';
+  serialized.text = text ? `${text}\n\n${extra}` : extra;
+}
+
+/** A checked part as its Chat SDK element, rebuilt from the fields it may have and nothing else. */
+function buildCardPart(part: CardPart): CardChild {
+  const props = (isRecord(part.props) ? part.props : {}) as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+  switch (part.type) {
+    case 'Text':
+      return props.style ? CardText(props.content, { style: props.style }) : CardText(props.content);
+    case 'Fields':
+      return Fields(
+        (part.children as Array<{ props: { label: string; value: string | number } }>).map((field) =>
+          Field({ label: field.props.label, value: String(field.props.value) }),
+        ),
+      );
+    case 'Table':
+      return Table({
+        headers: props.headers,
+        rows: (props.rows as Array<Array<string | number>>).map((row) => row.map(String)),
+        ...(props.align ? { align: props.align } : {}),
+        ...(props.caption ? { caption: props.caption } : {}),
+      });
+    case 'Chart': {
+      const chart = props.chart;
+      if (chart.type === 'pie') {
+        const segments = (chart.segments as Array<{ label: string; value: number }>).map(({ label, value }) => ({
+          label,
+          value,
+        }));
+        return Chart({ title: props.title, chart: { type: 'pie', segments } });
+      }
+      const categories = chart.categories as string[];
+      return Chart({
+        title: props.title,
+        chart: {
+          type: chart.type,
+          categories,
+          ...(chart.xLabel ? { xLabel: chart.xLabel } : {}),
+          ...(chart.yLabel ? { yLabel: chart.yLabel } : {}),
+          series: (chart.series as Array<{ name: string; values: number[] }>).map((series) => ({
+            name: series.name,
+            data: series.values.map((value, i) => ({ label: categories[i], value })),
+          })),
+        },
+      });
+    }
+    default:
+      return Divider();
+  }
+}
+
+export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
+  const { adapter } = config;
+  // The instance name becomes a webhook route segment (the route regex is
+  // [^/?]+) and ':' is the state-namespace delimiter — reject anything that
+  // would break either, at construction time rather than at first webhook.
+  // Positive allow-list (not a deny-list): also rejects '' and
+  // whitespace-only names, which are config bugs — '' is falsy, so it
+  // would skip a truthiness guard, dead-end the webhook route, and
+  // collapse the state namespace into the default instance's keyspace.
+  if (config.instance !== undefined && !INSTANCE_KEY_RE.test(config.instance)) {
+    throw new Error(
+      `chat-sdk bridge instance ${JSON.stringify(config.instance)} must be URL-safe: ` +
+        `non-empty, only letters, digits, '.', '_' or '-'`,
+    );
+  }
+  const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);
+  const cardText = (t: string): string => (config.escapeCardText ? config.escapeCardText(t) : t);
+  // Card titles are plain text, but these adapters put them into Markdown as
+  // is. `&` too, or a Markdown parser decodes `&#x202E;` into a hidden character.
+  const markdownTitles = ['telegram', 'teams', 'webex', 'mattermost'].includes(adapter.name);
+  const cardTitle =
+    config.escapeCardTitle ??
+    ((title: string): string => (markdownTitles ? title.replace(/[\\`*_~[\]()<>&]/g, '\\$&') : title));
+  const terminalMessage = ({ fromAgent, ...spec }: TerminalApprovalCard) => {
+    const questionText = fromAgent ? (t: string) => t : cardText;
+    return terminalApprovalMessage({
+      ...spec,
+      title: cardTitle(spec.title),
+      question: questionText(spec.question),
+      questionBlocks: spec.question ? splitCardText(spec.question, questionText, CARD_TEXT_BLOCK_LENGTH) : undefined,
+      resolution: cardText(spec.resolution),
+    });
+  };
+  /**
+   * Redraws a resolved card. A channel refuses a redraw past its size limit,
+   * and a card near that limit grew by its decision line. The title and the
+   * decision still fit, so a decided card is never left showing no decision.
+   */
+  const redrawResolved = async (threadId: string, messageId: string, spec: TerminalApprovalCard) => {
+    if (!terminalFits(spec)) spec = { ...spec, question: '' };
+    try {
+      return await adapter.editMessage(threadId, messageId, terminalMessage(spec));
+    } catch (err) {
+      if (!spec.question) throw err;
+      // Only a known size refusal justifies discarding request text. A lost
+      // reply or transient API failure retries the same idempotent edit.
+      const tooLong = err instanceof CardTooLongError;
+      log.warn('Retrying resolved card edit', { err, shortened: tooLong });
+      return adapter.editMessage(threadId, messageId, terminalMessage(tooLong ? { ...spec, question: '' } : spec));
+    }
+  };
+  /** Whether a resolved card still fits the channel's whole-card cap with its question kept.
+   *  Older Discord configurations get a conservative embed cap; other channels opt in. */
+  const terminalFits = ({ title, question, resolution, fromAgent }: TerminalApprovalCard): boolean => {
+    const limit = config.maxCardTextLength ?? (adapter.name === 'discord' ? 4000 : undefined);
+    if (limit === undefined) return true;
+    const blocks = splitCardText(question, fromAgent ? (t: string) => t : cardText, CARD_TEXT_BLOCK_LENGTH);
+    return !cardQuestionTooLong(cardTitle(title), [...blocks, cardText(resolution)].join('\n'), limit);
+  };
+  /** Registry/routing key for this bridge — also the app-context cache
+   *  namespace. Default instances key by the platform name. */
+  const instanceKey = config.instance ?? adapter.name;
+
+  /**
+   * One click path for every transport: decode the option, hand it to the host,
+   * then show only what the host did. An accepted click shows the decision; a
+   * closed request says so; a refused clicker is told privately. Anything else
+   * (already decided, expired, not ours) leaves the card as it is.
+   */
+  const resolveClick: ResolveClick = async (click, transport) => {
+    // Resolve render metadata BEFORE dispatching onAction (which deletes the row).
+    const render = await resolveQuestionRender(click.questionId);
+    // New format: button id/value is an integer index into options (kept
+    // short to fit Telegram's 64-byte callback_data cap). Old format:
+    // the full value is embedded in actionId/value directly.
+    const selectedOption = resolveSelectedOption(render, click.value, click.tail);
+    // An empty value counts when it is a real option's value, or on a card the host updates itself.
+    if (!selectedOption && !render?.deferResolution && !render?.options.some((o) => o.value === selectedOption)) return;
+    // A Discord thread's chat goes by one of two addresses: name the one the card was sent to.
+    const address =
+      click.otherPlatformId && render?.platformId === click.otherPlatformId
+        ? { ...click.address, platformId: click.otherPlatformId }
+        : click.address;
+    // Handed to the host before this returns, so clicks a transport delivers
+    // one after another reach it in that order. Its decision is waited for off
+    // the caller: a transport that reads its next events only once this returns
+    // (Telegram's polling) must not be held by one decision.
+    const decided = setupConfig.onAction(click.questionId, selectedOption, click.userId, address);
+    void showOutcome(click, transport, render, selectedOption, decided).catch((err: unknown) =>
+      log.error('Failed to handle a card click', { err }),
+    );
+  };
+  /** Waits for the host's decision on a click, then shows only what the host did. */
+  const showOutcome = async (
+    click: CardClick,
+    transport: ClickTransport,
+    render: Awaited<ReturnType<typeof resolveQuestionRender>>,
+    selectedOption: string,
+    decided: ReturnType<ChannelSetup['onAction']>,
+  ): Promise<void> => {
+    const outcome = await decided;
+    try {
+      if (outcome === 'refused') return await transport.notePrivately(REFUSED_CLICK_NOTE);
+      // The host redraws a deferred card itself before it accepts, whether or
+      // not that redraw worked: only the buttons are left to remove.
+      if (outcome === 'accepted' && render?.deferResolution) return transport.removeButtons?.();
+      // No render: already resolved (a late or repeated click), or a pending row
+      // without stored render metadata; deferred: the host updates the card itself.
+      if ((outcome !== 'accepted' && outcome !== 'closed') || !render || render.deferResolution || !click.messageId)
+        return;
+      const selectedLabel =
+        outcome === 'closed'
+          ? CLOSED_RESOLUTION
+          : (render.options.find((o) => o.value === selectedOption)?.selectedLabel ?? selectedOption);
+      const actorName = outcome === 'closed' ? '' : click.actorName;
+      // Every clicked card resolves the same way, on every channel: escaped.
+      const messageId = click.messageId;
+      const edit = redrawResolved(click.threadId, messageId, {
+        title: render.title,
+        question: render.question ?? click.fallbackQuestion ?? '',
+        fromAgent: render.fromAgent,
+        resolution: actorName ? `${selectedLabel} by ${actorName}` : selectedLabel,
+      });
+      if (transport.removeButtons) removeButtonsAfter(edit, transport.removeButtons);
+      await edit;
+      // eslint-disable-next-line no-catch-all/no-catch-all -- logged; a failed card update never undoes the decision
+    } catch (err) {
+      log.warn('Failed to update card after action', { err });
+    }
+  };
+  let chat: Chat;
+  let state: SqliteStateAdapter;
+  let setupConfig: ChannelSetup;
+  let gatewayAbort: AbortController | null = null;
+
+  async function messageToInbound(
+    message: ChatMessage,
+    isMention: boolean,
+    isGroup?: boolean,
+  ): Promise<InboundMessage> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const serialized = message.toJSON() as Record<string, any>;
+
+    // Download attachment data before serialization loses fetchData()
+    if (message.attachments && message.attachments.length > 0) {
+      const enriched = [];
+      for (const att of message.attachments) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const entry: Record<string, any> = {
+          type: att.type,
+          name: att.name,
+          mimeType: att.mimeType,
+          size: att.size,
+          width: (att as unknown as Record<string, unknown>).width,
+          height: (att as unknown as Record<string, unknown>).height,
+        };
+        if (att.fetchData) {
+          try {
+            entry.data = attachmentBytesToBase64(await att.fetchData());
+          } catch (err) {
+            log.warn('Failed to download attachment', { type: att.type, err });
+          }
+        }
+        enriched.push(entry);
+      }
+      serialized.attachments = enriched;
+    }
+
+    // Recover platform content the Chat SDK omitted, while raw is still here.
+    if (message.raw) {
+      appendRawText(serialized, message.raw as Record<string, unknown>, config.extractRawText);
+    }
+
+    // Extract reply context via platform-specific hook
+    if (config.extractReplyContext && message.raw) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const replyTo = config.extractReplyContext(message.raw as Record<string, any>);
+      if (replyTo) serialized.replyTo = replyTo;
+    }
+
+    // Project chat-sdk's nested author into the flat sender fields the router
+    // expects (see src/router.ts extractAndUpsertUser). Native adapters already
+    // populate these directly; this brings chat-sdk adapters in line.
+    const author = serialized.author as { userId?: string; fullName?: string; userName?: string } | undefined;
+    if (author) {
+      const name = author.fullName ?? author.userName;
+      serialized.senderId = author.userId;
+      serialized.sender = name;
+      serialized.senderName = name;
+    }
+
+    // Drop raw to save DB space (can be very large)
+    serialized.raw = undefined;
+
+    return {
+      id: message.id,
+      kind: 'chat-sdk',
+      content: serialized,
+      timestamp: message.metadata.dateSent.toISOString(),
+      isMention,
+      isGroup,
+    };
+  }
+
+  const bridge: ChannelAdapter = {
+    name: config.instance ?? adapter.name,
+    channelType: adapter.name, // unchanged — semantic platform key
+    instance: config.instance, // undefined ⇒ default instance
+
+    supportsThreads: config.supportsThreads,
+    defaults: config.defaults,
+
+    async setup(hostConfig: ChannelSetup) {
+      // Apply the registered inbound policy (if any) for this channel type.
+      // Wrapping here — the single point every dispatch path reads back
+      // through — means one policy covers onSubscribedMessage, onNewMention,
+      // onDirectMessage and onNewMessage alike.
+      const inboundPolicy = bridgeInboundPolicies.get(adapter.name);
+      setupConfig = inboundPolicy ? await inboundPolicy(hostConfig, instanceKey) : hostConfig;
+
+      // State namespace: ONLY for a named non-default instance. A skill
+      // that explicitly names the primary instance after the platform
+      // (instance === adapter.name) still lands on the legacy UNPREFIXED
+      // keyspace — prefixing the default would orphan every live install's
+      // chat_sdk_subscriptions/kv/locks/lists rows.
+      state = new SqliteStateAdapter(config.instance && config.instance !== adapter.name ? config.instance : undefined);
+
+      chat = new Chat({
+        adapters: { [adapter.name]: adapter },
+        userName: adapter.userName || 'NanoClaw',
+        concurrency: config.concurrency ?? 'concurrent',
+        state,
+        logger: chatSdkLogger(),
+      });
+
+      // Four SDK dispatch paths — bridge just forwards. All per-wiring
+      // engage / accumulate / drop / subscribe decisions live in the host
+      // router (src/router.ts routeInbound / evaluateEngage). The bridge
+      // only resolves channel ids and sets the platform-confirmed isMention
+      // flag that routeInbound evaluates; the router calls back into
+      // bridge.subscribe(...) when a mention-sticky wiring engages.
+
+      // Subscribed threads — every message in a thread we've previously
+      // engaged. Carry the SDK's `message.isMention` through so mention-mode
+      // wirings still fire on in-thread mentions.
+      chat.onSubscribedMessage(async (thread, message) => {
+        const channelId = adapter.channelIdFromThreadId(thread.id);
+        await setupConfig.onInbound(
+          channelId,
+          thread.id,
+          await messageToInbound(message, message.isMention === true, true),
+        );
+      });
+
+      // @mention in an unsubscribed thread — SDK-confirmed bot mention.
+      chat.onNewMention(async (thread, message) => {
+        const channelId = adapter.channelIdFromThreadId(thread.id);
+        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, true));
+      });
+
+      // DMs — by definition addressed to the bot. Thread id flows through
+      // unmodified (Slack users can open sub-threads inside a DM); whether it
+      // is honored is policy, not transport: the channel's declared
+      // dm.threads default (ChannelDefaults) or a per-wiring threads override
+      // decides at router fanout whether replies land in-thread or all DM
+      // sub-threads collapse into the one DM session.
+      chat.onDirectMessage(async (thread, message) => {
+        const channelId = adapter.channelIdFromThreadId(thread.id);
+        log.info('Inbound DM received', {
+          adapter: adapter.name,
+          channelId,
+          sender: (message.author as any)?.fullName ?? (message.author as any)?.userId ?? 'unknown',
+          threadId: thread.id,
+        });
+        const inbound = await messageToInbound(message, true, false);
+        // Agent-mode app context: DM-only by platform design.
+        attachAppContext(
+          inbound.content as Record<string, unknown>,
+          instanceKey,
+          channelId,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (message.author as any)?.userId,
+        );
+        const dmThreadId = normalizeDmThreadId(thread.id, message.id);
+        await setupConfig.onInbound(channelId, dmThreadId, inbound);
+      });
+
+      // Plain messages in unsubscribed threads.
+      //
+      // Chat SDK dispatch (handling-events.mdx §"Handler dispatch order") is
+      // exclusive: subscribed → onSubscribedMessage; unsubscribed+mention →
+      // onNewMention; unsubscribed+pattern-match → onNewMessage. Registering
+      // with `/[\s\S]*/` lets the router see every plain message (including
+      // media-only messages with empty text) on every unsubscribed thread the
+      // getMessagingGroupWithAgentCount (~1 DB read) for unwired channels,
+      // so forwarding every one is cheap enough to not need a bridge-side
+      // flood gate.
+      chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
+        const channelId = adapter.channelIdFromThreadId(thread.id);
+        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false, true));
+      });
+
+      // Agent-mode assistant context: cache the latest "what the user is
+      // viewing" per (channel, user). The installed chat core (4.41.1)
+      // dispatches assistant_thread_started and
+      // assistant_thread_context_changed into these handlers. Agent-view
+      // app_context_changed goes to onAppContextChanged, not registered here.
+      const rememberAppContext = (event: AssistantThreadStartedEvent | AssistantContextChangedEvent): void => {
+        cacheAppContext(instanceKey, event.channelId, event.userId, appContextEntities(event));
+      };
+      chat.onAssistantThreadStarted((event) => {
+        rememberAppContext(event);
+        dispatchAgentDmOpened({ instance: instanceKey, channelId: event.channelId });
+      });
+      chat.onAssistantContextChanged(rememberAppContext);
+
+      // Membership events: forwarded to the handler registered for this
+      // channel type (setMembershipHandler); no-op when none is registered.
+      // The chat core dispatches only member_joined_channel;
+      // member_left_channel arrives at the adapter but has no SDK handler
+      // in 4.41.1.
+      // TODO(member-left): when the chat core grows an onMemberLeftChannel
+      // dispatch, register it here and forward with { left: true } — the
+      // MembershipEvent type and dispatchMembership already carry it.
+      chat.onMemberJoinedChannel((event) => {
+        dispatchMembership({
+          instance: instanceKey,
+          channelType: adapter.name,
+          channelId: event.channelId,
+          userId: event.userId,
+          inviterId: event.inviterId,
+        });
+      });
+
+      // Handle button clicks (ask_user_question)
+      chat.onAction(async (event) => {
+        if (await dispatchQuestionAction(event, adapter, instanceKey)) return;
+        if (!event.actionId.startsWith('ncq:')) return;
+        const parts = event.actionId.split(':');
+        if (parts.length < 3) return;
+        await resolveClick(
+          {
+            questionId: parts[1],
+            tail: parts.slice(2).join(':'),
+            value: event.value,
+            userId: event.user?.userId || '',
+            actorName: event.user?.userName || event.user?.fullName || '',
+            messageId: event.messageId,
+            threadId: event.threadId,
+            address: {
+              instance: instanceKey,
+              messageId: event.messageId,
+              platformId: adapter.channelIdFromThreadId(event.threadId),
+            },
+          },
+          { notePrivately: (text) => tellPrivately(event, text) },
+        );
+      });
+
+      await chat.initialize();
+
+      // Test seam: unit tests drive the SDK's public process* dispatchers
+      // (processAssistantContextChanged, …) against the handlers registered
+      // above without a live platform. Not part of the ChannelAdapter
+      // contract.
+      (bridge as unknown as { _chat?: Chat })._chat = chat;
+
+      // Start Gateway listener for adapters that support it (e.g., Discord)
+      const gatewayAdapter = adapter as GatewayAdapter;
+      if (gatewayAdapter.startGatewayListener) {
+        gatewayAbort = new AbortController();
+
+        // Start local HTTP server to receive forwarded Gateway events (including interactions)
+        const webhookUrl = await startLocalWebhookServer(gatewayAdapter, config.botToken, resolveClick);
+
+        // Exponential backoff capped at 1h. Without this, an unrecoverable
+        // failure (e.g., TokenInvalid) restarts ~10×/sec and Discord's
+        // Cloudflare layer issues a multi-hour IP block. A run that lasts
+        // longer than 5 minutes counts as healthy and resets the counter.
+        let consecutiveFailures = 0;
+        const startGateway = () => {
+          if (gatewayAbort?.signal.aborted) return;
+          const startedAt = Date.now();
+          // Capture the long-running listener promise via waitUntil
+          let listenerPromise: Promise<unknown> | undefined;
+          void gatewayAdapter.startGatewayListener!(
+            {
+              waitUntil: (p: Promise<unknown>) => {
+                listenerPromise = p;
+              },
+            },
+            24 * 60 * 60 * 1000,
+            gatewayAbort!.signal,
+            webhookUrl,
+          ).then(() => {
+            // startGatewayListener resolves immediately with a Response;
+            // the actual work is in the listenerPromise passed to waitUntil
+            if (!listenerPromise) return;
+            const reschedule = (err?: unknown) => {
+              if (gatewayAbort?.signal.aborted) return;
+              const ranForMs = Date.now() - startedAt;
+              if (ranForMs > 5 * 60 * 1000) consecutiveFailures = 0;
+              else consecutiveFailures++;
+              const delayMs = Math.min(60 * 60 * 1000, 2 ** consecutiveFailures * 1000);
+              if (err) {
+                log.error('Gateway listener error, retrying', {
+                  adapter: adapter.name,
+                  err,
+                  consecutiveFailures,
+                  delayMs,
+                });
+              } else {
+                log.info('Gateway listener expired, restarting', {
+                  adapter: adapter.name,
+                  consecutiveFailures,
+                  delayMs,
+                });
+              }
+              setTimeout(startGateway, delayMs);
+            };
+            void listenerPromise.then(() => reschedule()).catch(reschedule);
+          });
+        };
+        startGateway();
+        log.info('Gateway listener started', { adapter: adapter.name });
+      } else if ('runtimeMode' in adapter && adapter.runtimeMode === 'polling') {
+        // Polling adapters (Telegram) pull updates themselves; a route here
+        // would only bind the shared webhook port for nothing. Read after
+        // initialize(): the adapter resolves mode 'auto' there.
+        log.info('Polling adapter: no webhook route registered', { adapter: adapter.name });
+      } else {
+        // Non-gateway adapters (Slack, Teams, GitHub, etc.) — register on the
+        // shared webhook server. The handler key stays adapter.name (the
+        // Chat instance's webhooks map is keyed by it); the route segment is
+        // the instance, so each same-platform bridge gets its own URL (and
+        // its own signing secret — platforms sign per-app).
+        registerWebhookAdapter(chat, adapter.name, config.instance ?? adapter.name);
+      }
+
+      log.info('Chat SDK bridge initialized', { adapter: adapter.name });
+    },
+
+    async deliver(platformId: string, threadId: string | null, message): Promise<string | undefined> {
+      // platformId is already in the adapter's encoded format (e.g. "telegram:6037840640",
+      // "discord:guildId:channelId") — use it directly as the thread ID
+      const tid = threadId ?? platformId;
+      const content = message.content as Record<string, unknown>;
+
+      if (content.operation === 'edit' && content.messageId) {
+        const render =
+          typeof content.questionId === 'string' ? await resolveQuestionRender(content.questionId) : undefined;
+        if (render?.renderTerminal && content.terminalCard) {
+          const terminal = content.terminalCard as { resolution: string };
+          await adapter.editMessage(tid, content.messageId as string, render.renderTerminal(terminal.resolution));
+          return;
+        }
+        const terminalCard = content.terminalCard as Partial<TerminalApprovalCard> | undefined;
+        if (
+          terminalCard &&
+          typeof terminalCard.title === 'string' &&
+          typeof terminalCard.question === 'string' &&
+          typeof terminalCard.resolution === 'string'
+        ) {
+          // A host row must not disable escaping by supplying fromAgent.
+          const { title, question, resolution } = terminalCard as TerminalApprovalCard;
+          await redrawResolved(tid, content.messageId as string, { title, question, resolution });
+        } else {
+          await adapter.editMessage(tid, content.messageId as string, {
+            markdown: transformText((content.text as string) || (content.markdown as string) || ''),
+          });
+        }
+        return;
+      }
+
+      if (content.operation === 'reaction' && content.messageId && content.emoji) {
+        await adapter.addReaction(tid, content.messageId as string, content.emoji as string);
+        return;
+      }
+
+      // Ask question card — render as Card with buttons
+      if (content.type === 'ask_question' && content.questionId && content.options) {
+        const questionId = content.questionId as string;
+        const title = content.title as string;
+        const question = content.question as string;
+        if (!title) {
+          log.error('ask_question missing required title — skipping delivery', { questionId });
+          return;
+        }
+        const render = content.requirePresentation ? await resolveQuestionRender(questionId) : undefined;
+        if (render?.renderMessage) {
+          const result = await adapter.postMessage(tid, render.renderMessage(questionId));
+          return result?.id;
+        }
+        if (content.requirePresentation) throw new Error('Approval presentation adapter is unavailable');
+        // Long text goes out as several blocks, measured after escaping, so no
+        // per-block cap cuts it. A platform that caps the whole card refuses
+        // what it can't show, counting the fences the split adds.
+        // Questions an agent asks itself keep their own markup (`fromAgent`).
+        const escape = content.fromAgent === true ? (t: string) => t : cardText;
+        const text = escape(question);
+        const blocks = splitCardText(question, escape, CARD_TEXT_BLOCK_LENGTH);
+        if (config.maxCardTextLength !== undefined) {
+          const tooLong = cardQuestionTooLong(cardTitle(title), blocks.join('\n'), config.maxCardTextLength);
+          if (tooLong) throw new CardTooLongError(tooLong);
+        }
+        const options: NormalizedOption[] = normalizeOptions(content.options as never);
+        const card = Card({
+          title: cardTitle(title),
+          children: [
+            ...blocks.map((block) => CardText(block)),
+            Actions(
+              // Encode button id/value with the option index rather than the
+              // full value. Telegram caps callback_data at 64 bytes, and
+              // long values (e.g. ISO datetimes, URLs) push the JSON payload
+              // well past that. The onAction handlers resolve the index back
+              // to the real value via resolveQuestionRender(questionId).
+              options.map((opt, idx) =>
+                Button({ id: `ncq:${questionId}:${idx}`, label: opt.label, value: String(idx), style: opt.style }),
+              ),
+            ),
+          ],
+        });
+        const result = await adapter.postMessage(tid, {
+          card,
+          fallbackText: `${title}\n\n${text}\nOptions: ${options.map((o) => o.label).join(', ')}`,
+        });
+        return result?.id;
+      }
+
+      // Display card (send_card MCP tool) — returns immediately, no callback flow.
+      // Non-URL actions are dropped: send_card's contract is fire-and-forget, so a
+      // callback button would have nowhere to land. URL actions render as link buttons.
+      // The runner filters these against LINK_ACTION_SCHEMA before writing the row;
+      // the checks below still stand because any producer can write this payload.
+      if (content.type === 'card' && content.card && typeof content.card === 'object') {
+        const cardSpec = content.card as Record<string, unknown>;
+        const title = (cardSpec.title as string) || '';
+        const fallbackText = (content.fallbackText as string) || (cardSpec.description as string) || title || '';
+
+        // Checked again here: anything in the container can write this row, not only send_card.
+        const problems = cardProblems(cardSpec);
+        if (problems.length > 0) throw new Error(`send_card card refused: ${problems.join('; ')}`);
+
+        const cardChildren: CardChild[] = [];
+        if (typeof cardSpec.description === 'string' && cardSpec.description) {
+          cardChildren.push(CardText(cardSpec.description));
+        }
+        if (Array.isArray(cardSpec.children)) {
+          for (const child of cardSpec.children) {
+            if (isCardPart(child)) {
+              cardChildren.push(buildCardPart(child));
+            } else if (typeof child === 'string' && child) {
+              cardChildren.push(CardText(child));
+            } else if (
+              child &&
+              typeof child === 'object' &&
+              typeof (child as Record<string, unknown>).text === 'string'
+            ) {
+              cardChildren.push(CardText((child as Record<string, string>).text));
+            }
+          }
+        }
+        if (Array.isArray(cardSpec.actions)) {
+          const linkButtons = (cardSpec.actions as Array<Record<string, unknown> | null | undefined>)
+            .filter(
+              (a): a is Record<string, unknown> =>
+                !!a &&
+                typeof a === 'object' &&
+                typeof a.url === 'string' &&
+                !!a.url &&
+                typeof a.label === 'string' &&
+                !!a.label,
+            )
+            .map((a) => {
+              const style = a.style;
+              const safeStyle: 'primary' | 'danger' | 'default' | undefined =
+                style === 'primary' || style === 'danger' || style === 'default' ? style : undefined;
+              return LinkButton({
+                label: a.label as string,
+                url: a.url as string,
+                style: safeStyle,
+              });
+            });
+          if (linkButtons.length > 0) {
+            cardChildren.push(Actions(linkButtons));
+          }
+        }
+
+        if (cardChildren.length === 0 && !title) {
+          log.warn('send_card payload empty, skipping delivery');
+          return;
+        }
+
+        const card = Card({ title: cardTitle(title), children: cardChildren });
+        const result = await adapter.postMessage(tid, { card, fallbackText });
+        return result?.id;
+      }
+
+      // Normal message
+      const rawText = (content.markdown as string) || (content.text as string);
+      const text = rawText ? transformText(rawText) : rawText;
+      if (text) {
+        // Attach files if present (FileUpload format: { data, filename })
+        const fileUploads = message.files?.map((f: { data: Buffer; filename: string }) => ({
+          data: f.data,
+          filename: f.filename,
+        }));
+        // Split if over the adapter's max length. Files ride on the first
+        // chunk so the head of the reply still carries them.
+        const chunks =
+          config.maxTextLength && text.length > config.maxTextLength
+            ? splitForLimit(text, config.maxTextLength)
+            : [text];
+        // A retry of a reply that failed mid-split starts at the failed part:
+        // posting from part 1 again repeats what the user already has.
+        const progress =
+          chunks.length > 1 && message.deliveryId && state
+            ? new SplitProgressStore(state, message.deliveryId, tid, chunks)
+            : undefined;
+        const resumed = await progress?.read();
+        let firstId = resumed?.firstId;
+        for (let i = resumed?.posted ?? 0; i < chunks.length; i++) {
+          const chunk = chunks[i];
+          const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
+          const result = await adapter.postMessage(
+            tid,
+            attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
+          );
+          if (i === 0) firstId = result?.id;
+          await progress?.save(i + 1, firstId);
+        }
+        return firstId;
+      } else if (message.files && message.files.length > 0) {
+        // Files only, no text
+        const fileUploads = message.files.map((f: { data: Buffer; filename: string }) => ({
+          data: f.data,
+          filename: f.filename,
+        }));
+        const result = await adapter.postMessage(tid, { markdown: '', files: fileUploads });
+        return result?.id;
+      }
+    },
+
+    async setTyping(platformId: string, threadId: string | null) {
+      const tid = threadId ?? platformId;
+      await adapter.startTyping(tid);
+    },
+
+    async teardown() {
+      gatewayAbort?.abort();
+      await chat.shutdown();
+      log.info('Chat SDK bridge shut down', { adapter: adapter.name });
+    },
+
+    isConnected() {
+      const probe = (adapter as ConnectionAwareAdapter).isConnected;
+      return probe ? probe.call(adapter) : true;
+    },
+
+    async subscribe(_platformId: string, threadId: string) {
+      // Chat SDK's subscription state lives on the StateAdapter (not on the
+      // Chat instance itself). SqliteStateAdapter.subscribe is idempotent —
+      // a second call on an already-subscribed thread is a no-op. threadId
+      // is the SDK's thread id, which is what the router already has from
+      // the original inbound event.
+      await state.subscribe(threadId);
+    },
+
+    async readHistory(
+      platformId: string,
+      threadId: string | null,
+      { limit }: { limit: number },
+    ): Promise<HistoryLine[]> {
+      if (threadId !== null && adapter.channelIdFromThreadId(threadId) !== platformId) {
+        throw new Error('History read refused: thread is not in this chat');
+      }
+      // The library reads the platform, or its own cache on platforms without
+      // server-side history.
+      const { messages } =
+        threadId === null
+          ? await chat.history.channel.listMessages(platformId, { limit })
+          : await chat.history.thread.list(threadId, { limit });
+      return messages.map((m) => {
+        // The text an inbound message of this line would carry.
+        const read = { text: m.text };
+        if (m.raw) appendRawText(read, m.raw as Record<string, unknown>, config.extractRawText);
+        return {
+          id: m.id,
+          timestamp: m.metadata.dateSent.toISOString(),
+          senderId: m.author.userId,
+          senderName: m.author.fullName || m.author.userName,
+          text: read.text,
+          isBot: m.author.isBot === true,
+          isSelf: m.author.isMe,
+          threadId: m.threadId,
+          raw: m.raw,
+        };
+      });
+    },
+  };
+
+  // Only expose openDM when the underlying Chat SDK adapter implements it.
+  // Delegate straight to adapter.openDM rather than going through chat.openDM:
+  // the latter dispatches via inferAdapterFromUserId, which only recognizes
+  // Discord snowflakes, Slack U-ids, Teams 29:-ids, and gChat users/-ids, and
+  // throws for everything else (Telegram numeric ids, iMessage, Matrix, …).
+  // Calling adapter.openDM directly also preserves the adapter's native
+  // platform_id encoding via channelIdFromThreadId (e.g. "telegram:<chatId>"),
+  // which matches what onInbound stores in messaging_groups — avoiding a
+  // duplicate-row / decode-error cascade at delivery time. See user-dm.ts for
+  // the direct-addressable fallback when the adapter has no openDM at all.
+  if (adapter.openDM) {
+    bridge.openDM = async (userHandle: string): Promise<string> => {
+      const threadId = await adapter.openDM!(userHandle);
+      return adapter.channelIdFromThreadId(threadId);
+    };
+  }
+
+  return bridge;
+}
+
+/** Only the clicker sees it; nothing is posted where the channel has no private message (no DM fallback). */
+async function tellPrivately(event: ActionEvent, text: string): Promise<void> {
+  try {
+    await event.thread?.postEphemeral(event.user, text, { fallbackToDM: false });
+    // eslint-disable-next-line no-catch-all/no-catch-all -- a failed note leaves the card as it is either way
+  } catch (err) {
+    log.warn('Failed to tell a clicker privately', { err });
+  }
+}
+
+/** A click on a card, whichever transport delivered it. */
+interface CardClick {
+  questionId: string;
+  /** The action id after the question id (old format: the option value itself). */
+  tail: string;
+  /** The button's value (new format: an option index). */
+  value: string | undefined;
+  userId: string;
+  actorName: string;
+  /** The clicked card's message, when the transport knows it. */
+  messageId: string | undefined;
+  threadId: string;
+  address: { instance?: string; messageId?: string; platformId?: string };
+  /** The chat's second address, where a transport has two for one place (a Discord thread). */
+  otherPlatformId?: string;
+  /** Card text to keep when the render has none (Discord: the original embed's). */
+  fallbackQuestion?: string;
+}
+
+/** How a transport answers the clicker. */
+interface ClickTransport {
+  /** Only the clicker sees it; nothing is posted where the channel can't. */
+  notePrivately(text: string): Promise<void>;
+  /** Removes the buttons apart from the card edit, where the transport can; see removeButtonsAfter. Never awaited. */
+  removeButtons?(): void;
+}
+
+type ResolveClick = (click: CardClick, transport: ClickTransport) => Promise<void>;
+
+/** How long a clicked card's edit may run before its buttons go anyway. */
+export const CARD_EDIT_SETTLE_MS = 5_000;
+
+/**
+ * Removes the buttons once the card edit settles, or once it has stalled for
+ * CARD_EDIT_SETTLE_MS. Not alongside it: two edits of one message in flight
+ * together can drop the edit's text (Discord kept only the button removal).
+ */
+function removeButtonsAfter(edit: Promise<unknown>, removeButtons: () => void): void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stalled = new Promise<void>((resolve) => (timer = setTimeout(resolve, CARD_EDIT_SETTLE_MS)));
+  const settled = edit.then(
+    () => undefined,
+    () => undefined,
+  );
+  void Promise.race([settled, stalled]).then(() => {
+    clearTimeout(timer);
+    removeButtons();
+  });
+}
+
+/**
+ * Start a local HTTP server to receive forwarded Gateway events.
+ * This is needed because the Gateway listener in webhook-forwarding mode
+ * sends ALL raw events (including INTERACTION_CREATE for button clicks)
+ * to the webhookUrl, which we handle here.
+ *
+ * Loopback is not a trust boundary, so only our own Gateway listener may post
+ * here: it sends the bot token in x-discord-gateway-token on every forward.
+ */
+function startLocalWebhookServer(
+  adapter: GatewayAdapter,
+  botToken: string | undefined,
+  resolveClick: ResolveClick,
+): Promise<string> {
+  return new Promise((resolve) => {
+    const server = http.createServer((req, res) => {
+      if (!gatewayTokenMatches(req.headers['x-discord-gateway-token'], botToken)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end('{"error":"unauthorized"}');
+        return;
+      }
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        const body = Buffer.concat(chunks).toString();
+        handleForwardedEvent(body, adapter, botToken, resolveClick)
+          .then(() => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end('{"ok":true}');
+          })
+          .catch((err) => {
+            log.error('Webhook server error', { err });
+            res.writeHead(500);
+            res.end('{"error":"internal"}');
+          });
+      });
+    });
+
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address() as { port: number };
+      const url = `http://127.0.0.1:${addr.port}/webhook`;
+      log.info('Local webhook server started', { port: addr.port });
+      resolve(url);
+    });
+  });
+}
+
+/** Constant-time check; hashing first keeps the lengths equal. No token configured means no match. */
+function gatewayTokenMatches(header: string | string[] | undefined, botToken: string | undefined): boolean {
+  if (!botToken || typeof header !== 'string') return false;
+  const digest = (s: string) => createHash('sha256').update(s).digest();
+  return timingSafeEqual(digest(header), digest(botToken));
+}
+
+/**
+ * Bounds each interaction call. Discord voids a first response after 3 s, so
+ * an ack still pending past this can only fail; unbounded, one stalled call
+ * held up its click for good, and the channel's events queued behind it.
+ */
+const INTERACTION_CALLBACK_TIMEOUT_MS = 10_000;
+
+async function handleForwardedEvent(
+  body: string,
+  adapter: GatewayAdapter,
+  botToken: string | undefined,
+  resolveClick: ResolveClick,
+): Promise<void> {
+  let event: { type: string; data: Record<string, unknown> };
+  try {
+    event = JSON.parse(body);
+  } catch {
+    return;
+  }
+
+  // Handle interaction events (button clicks) — not handled by adapter's handleForwardedGatewayEvent
+  if (event.type === 'GATEWAY_INTERACTION_CREATE' && event.data) {
+    const interaction = event.data;
+    // type 3 = MessageComponent (button/select)
+    if (interaction.type === 3) {
+      const customId = (interaction.data as Record<string, unknown>)?.custom_id as string;
+      // In guilds the clicker is at interaction.member.user; in DMs it's interaction.user directly.
+      const user =
+        ((interaction.member as Record<string, unknown>)?.user as Record<string, string> | undefined) ??
+        (interaction.user as Record<string, string> | undefined);
+      const interactionId = interaction.id as string;
+      const interactionToken = interaction.token as string;
+      /** Set while the ack is on its way: the interaction's webhook works only after it. */
+      let acking: Promise<void> | undefined;
+      /** Answers within Discord's 3 s; a failed ack must never drop the decision dispatched with it. */
+      const ack = async (response: Record<string, unknown>) => {
+        try {
+          const result = await fetch(
+            `https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(response),
+              signal: AbortSignal.timeout(INTERACTION_CALLBACK_TIMEOUT_MS),
+            },
+          );
+          if (!result.ok) log.error('Failed to acknowledge interaction', { status: result.status });
+          // eslint-disable-next-line no-catch-all/no-catch-all -- the decision is dispatched either way
+        } catch (err) {
+          log.error('Failed to acknowledge interaction', { err });
+        }
+      };
+      /** The interaction's webhook (a private follow-up, or the clicked message); a failure never stops the card edit. */
+      const webhook = async (method: 'POST' | 'PATCH', path: string, body: Record<string, unknown>) => {
+        if (acking) await acking;
+        try {
+          const result = await fetch(
+            `https://discord.com/api/v10/webhooks/${interaction.application_id as string}/${interactionToken}${path}`,
+            {
+              method,
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+              signal: AbortSignal.timeout(INTERACTION_CALLBACK_TIMEOUT_MS),
+            },
+          );
+          if (!result.ok) log.error('Discord interaction webhook failed', { method, status: result.status });
+          // eslint-disable-next-line no-catch-all/no-catch-all -- the host has decided either way
+        } catch (err) {
+          log.error('Discord interaction webhook failed', { method, err });
+        }
+      };
+      const messageId = (interaction.message as Record<string, unknown> | undefined)?.id as string | undefined;
+
+      // Parse the selected option from custom_id. The adapter writes
+      // `${buttonId}\n${value}` (Chat SDK 4.41+); older cards carry the id alone.
+      const delimiter = customId?.indexOf('\n') ?? -1;
+      const actionId = delimiter === -1 ? customId : customId.slice(0, delimiter);
+      const encodedValue = delimiter === -1 ? undefined : customId.slice(delimiter + 1);
+      let questionId: string | undefined;
+      let tail: string | undefined;
+      if (actionId?.startsWith('ncq:')) {
+        const colonIdx = actionId.indexOf(':', 4); // after "ncq:"
+        if (colonIdx !== -1) {
+          questionId = actionId.slice(4, colonIdx);
+          tail = actionId.slice(colonIdx + 1);
+        }
+      }
+
+      const originalEmbeds =
+        ((interaction.message as Record<string, unknown>)?.embeds as Array<Record<string, unknown>>) || [];
+      const originalDescription = (originalEmbeds[0]?.description as string) || '';
+      // Ack at once and keep the buttons (DEFERRED_UPDATE_MESSAGE): the card
+      // changes only after the host accepts the click. Not awaited: the listener
+      // forwards a channel's next event only once this one is answered.
+      acking = ack({ type: 6 }).then(() => {
+        acking = undefined;
+      });
+      if (!questionId) return;
+      // Announcement (10), public and private threads. The adapter keys a thread's
+      // messages by parent channel and thread when it knows the parent, and by the
+      // thread alone when it does not (a failed lookup, or a later message in an
+      // announcement thread). A card's chat can be either, so the click carries both.
+      const channel = interaction.channel as { type?: number; parent_id?: string } | undefined;
+      const inThread = (channel?.type === 10 || channel?.type === 11 || channel?.type === 12) && channel.parent_id;
+      const guildId = (interaction.guild_id as string | undefined) || '@me';
+      const channelId = interaction.channel_id as string;
+      const threadId = adapter.encodeThreadId({
+        guildId,
+        channelId: inThread ? channel.parent_id! : channelId,
+        ...(inThread ? { threadId: channelId } : {}),
+      });
+
+      // The rest runs in the background: Discord forwards a channel's events in
+      // order, so the host's decision must not hold them.
+      void (async () =>
+        resolveClick(
+          {
+            questionId,
+            tail: tail ?? '',
+            // Discord custom_id mirrors the index-based encoding (see Button construction).
+            value: encodedValue ?? tail,
+            userId: user?.id || '',
+            actorName: user?.global_name || user?.username || '',
+            messageId,
+            threadId,
+            address: { messageId, platformId: adapter.channelIdFromThreadId(threadId) },
+            ...(inThread ? { otherPlatformId: adapter.encodeThreadId({ guildId, channelId }) } : {}),
+            fallbackQuestion: originalDescription,
+          },
+          {
+            // flags 64: only the clicker sees it.
+            notePrivately: (text) => webhook('POST', '', { content: text, flags: 64 }),
+            // Components only: the embed stays, so no length limit can reject it.
+            removeButtons: () => void webhook('PATCH', '/messages/@original', { components: [] }),
+          },
+        ))().catch((err: unknown) => log.error('Failed to update interaction', { err }));
+      return;
+    }
+  }
+
+  // Forward other events to the adapter's webhook handler for normal processing
+  const fakeRequest = new Request('http://localhost/webhook', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-discord-gateway-token': botToken || '',
+    },
+    body,
+  });
+  await adapter.handleWebhook(fakeRequest, {});
+}
