@@ -1,0 +1,67 @@
+/**
+ * Shared "finalize a rejected approval" path.
+ *
+ * Three entry points land here so they relay one message and clean up
+ * identically:
+ *   1. The instant Reject button            (response-handler.ts)
+ *   2. A captured Reject-with-reason reply   (reason-capture.ts)
+ *   3. The host-sweep ghost finalizer        (reason-capture.ts, via host-sweep)
+ *
+ * Kept in its own leaf file so both response-handler.ts and reason-capture.ts
+ * can import it without an import cycle (finalize → primitive only).
+ */
+import { requestWake } from '../../request-wake.js';
+import { deletePendingApproval, transitionPendingApprovalStatus } from '../../db/sessions.js';
+import { log } from '../../log.js';
+import { writeSessionMessage } from '../../session-manager.js';
+import type { PendingApproval, Session } from '../../types.js';
+import { notifyApprovalResolved } from './primitive.js';
+
+/**
+ * Notify the requesting agent that its action was rejected, drop the pending
+ * row, fire approval-resolved callbacks, and wake the container.
+ *
+ * When `reason` is provided it's appended to the agent-facing note with generic
+ * attribution — the why, not the who (the rejecting admin may belong to a
+ * different owner than the requesting agent). Callers are responsible for
+ * clamping the reason length before passing it in. `from` is the status the
+ * row must still hold (default: its status as read); `accepted` is told once the
+ * reject is recorded, before the agent is notified and woken.
+ */
+export async function finalizeReject(
+  approval: PendingApproval,
+  session: Session,
+  userId: string,
+  options: { reason?: string; from?: 'pending' | 'awaiting_reason'; accepted?: () => void } = {},
+): Promise<boolean> {
+  const { reason, accepted } = options;
+  const from = options.from ?? (approval.status === 'awaiting_reason' ? 'awaiting_reason' : 'pending');
+  if (!(await transitionPendingApprovalStatus(approval.approval_id, from, 'rejected'))) return false;
+  accepted?.();
+
+  const text = reason
+    ? `Your ${approval.action} request was rejected by admin: "${reason}"`
+    : `Your ${approval.action} request was rejected by admin.`;
+
+  await writeSessionMessage(session.agent_group_id, session.id, {
+    id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: session.agent_group_id,
+    channelType: 'agent',
+    threadId: null,
+    content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
+  });
+
+  log.info('Approval rejected', {
+    approvalId: approval.approval_id,
+    action: approval.action,
+    userId,
+    withReason: reason !== undefined,
+  });
+
+  await deletePendingApproval(approval.approval_id);
+  await notifyApprovalResolved({ approval, session, outcome: 'reject', userId });
+  await requestWake(session, 'approval-response');
+  return true;
+}
